@@ -1,0 +1,1750 @@
++---
+output: html_notebook
+title: "Global Analyses Manuscript"
+date: '2023-08-02'
+---
+```{r libraries}
+library(dplyr)
+library(feather)
+library(moments)
+library(stringr)
+library(reshape2)
+library(gtsummary)
+library(gt)
+library(rstatix)
+library(cowplot)
+library(ggplot2)
+library(ggpubr)
+library(devtools)
+library(knitr)
+library(kableExtra)
+library(tidyr)
+library(GGally)
+library(ggbeeswarm)
+library(devtools)
+library(fslmer)
+library(latex2exp)
+library(gridExtra)
+# library(Hmisc)
+#devtools::install_github("psyteachr/introdataviz")
+
+rm(list=ls())
+```
+
+```{r useful}
+options(scipen = 999)
+
+GeomSplitViolin <- ggplot2::ggproto(
+    "GeomSplitViolin",
+    ggplot2::GeomViolin,
+    draw_group = function(self,
+                          data,
+                          ...,
+                          # add the nudge here
+                          nudge = 0,
+                          draw_quantiles = NULL) {
+        data <- transform(data,
+                          xminv = x - violinwidth * (x - xmin),
+                          xmaxv = x + violinwidth * (xmax - x))
+        grp <- data[1, "group"]
+        newdata <- plyr::arrange(transform(data,
+                                           x = if (grp %% 2 == 1) xminv else xmaxv),
+                                 if (grp %% 2 == 1) y else -y)
+        newdata <- rbind(newdata[1, ],
+                         newdata,
+                         newdata[nrow(newdata), ],
+                         newdata[1, ])
+        newdata[c(1, nrow(newdata)-1, nrow(newdata)), "x"] <- round(newdata[1, "x"])
+
+        # now nudge them apart
+        newdata$x <- ifelse(newdata$group %% 2 == 1,
+                            newdata$x - nudge,
+                            newdata$x + nudge)
+
+        if (length(draw_quantiles) > 0 & !scales::zero_range(range(data$y))) {
+
+            stopifnot(all(draw_quantiles >= 0), all(draw_quantiles <= 1))
+
+            quantiles <- ggplot2:::create_quantile_segment_frame(data,
+                                                             draw_quantiles)
+            aesthetics <- data[rep(1, nrow(quantiles)),
+                               setdiff(names(data), c("x", "y")),
+                               drop = FALSE]
+            aesthetics$alpha <- rep(1, nrow(quantiles))
+            both <- cbind(quantiles, aesthetics)
+            quantile_grob <- ggplot2::GeomPath$draw_panel(both, ...)
+            ggplot2:::ggname("geom_split_violin",
+                             grid::grobTree(ggplot2::GeomPolygon$draw_panel(newdata, ...),
+                                            quantile_grob))
+        }
+    else {
+            ggplot2:::ggname("geom_split_violin",
+                             ggplot2::GeomPolygon$draw_panel(newdata, ...))
+        }
+    }
+)
+
+geom_split_violin <- function(mapping = NULL,
+                              data = NULL,
+                              stat = "ydensity",
+                              position = "identity",
+                              # nudge param here
+                              nudge = 0,
+                              ...,
+                              draw_quantiles = NULL,
+                              trim = TRUE,
+                              scale = "area",
+                              na.rm = FALSE,
+                              show.legend = NA,
+                              inherit.aes = TRUE) {
+
+    ggplot2::layer(data = data,
+                   mapping = mapping,
+                   stat = stat,
+                   geom = GeomSplitViolin,
+                   position = position,
+                   show.legend = show.legend,
+                   inherit.aes = inherit.aes,
+                   params = list(trim = trim,
+                                 scale = scale,
+                                 # don't forget the nudge
+                                 nudge = nudge,
+                                 draw_quantiles = draw_quantiles,
+                                 na.rm = na.rm,
+                                 ...))
+}
+
+fig_path = getwd()
+options(knitr.kable.NA = '')
+
+fdr_thr = function(pValues){
+# order the p-values
+pValues <- sort(pValues)
+# BH-procedure
+alpha <- 0.05
+m <- length(pValues)
+qValues <- c()
+for (i in 1:m){
+  qV <- (i/m)*alpha
+  qValues <- append(qValues, qV)
+}
+# find the largest p-value that satisfies p_i < q_i  
+BH_test <- qValues > pValues
+# largest k 
+threshold <- pValues[sum(BH_test)];
+return(threshold)}
+
+printVar = function(x,y,threshold){
+vals = cor.test(x,y,
+method="pearson")[c("estimate","p.value")]
+names(vals) = c("rho","p")
+vals$fdr.sig = ifelse(vals$p<=threshold,"*","")
+vals$p.label = round(vals$p,3)
+vals$p.label  =ifelse(vals$p.label<0.001,"<0.001",vals$p.label)
+vals$label = paste0("R= ",round(vals$rho,2),vals$fdr.sig,"\np= ",format(vals$p.label,digits=3))
+vals$label = str_replace(vals$label,"=<","<")
+vals$label
+# paste(names(vals),signif(unlist(vals),2),collapse="\n")
+}
+
+# for correlation matrix
+my_fn <- function(data, mapping, method="p", use="pairwise", threshold, ...){
+              # grab data
+              x <- eval_data_col(data, mapping$x)
+              y <- eval_data_col(data, mapping$y)
+              # calculate correlation
+              corr <- cor(x, y, method=method, use=use)
+              # calculate colour based on correlation value
+               colFn <- colorRampPalette(c("blue", "white", "red"), interpolate ='spline')
+              fill <- colFn(100)[findInterval(corr, seq(-1, 1, length=100))]
+              
+              mainCor = printVar(x,y,threshold)
+              
+              ggplot(data=data,mapping=mapping) + 
+                annotate(x=0.5,y=0.8,label=mainCor,geom="text",size=8) +
+                theme_void() +
+                theme(panel.background = element_rect(fill=fill))
+}
+
+my_fn2 <- function(data, mapping, method="lm", ...){
+  p2 <- ggplot(data = data, mapping = mapping) + 
+    geom_point(alpha=0.8) + 
+    geom_smooth(method=method,colour="black", ...)+theme_bw()
+  p2
+} 
+
+colFn <- colorRampPalette(c("blue", "white", "red"), interpolate ='spline')
+pvalue_cor <- function(x) {
+  pval=as.data.frame(NA)
+  for (i in colnames(x)){
+    for (j in colnames(x))
+      pval[i,j]=cor.test(x[[i]],x[[j]])$p.value
+  }
+  P.sig=as.matrix(pval[-1,-1])
+  return(P.sig)}
+
+```
+
+```{r load_datasets}
+main.wide = feather::read_feather("./main.wide.feather")
+repl.wide = feather::read_feather("./repl.wide.feather")
+```
+
+
+## Demographics
+
+**Table 1:** Demographics of the main and replication datasets.
+
+Main Dataset.
+
+```{r assumption_norm}
+# Data assumptions
+col_check=c("Age.ses.3","PrgWeeks","GestationalBirthWeeks","PostPartum.days","InterSessions.days","PostPartum.pc","Total.Digits.WAIS.ses.3","meanEulerNumber.ses.3","meanEulerNumber.ses.4")
+skew.mother = sapply(main.wide[main.wide$Group=="mother",col_check], function(x) skewness(x))
+kurt.mother = sapply(main.wide[main.wide$Group=="mother",col_check], function(x) kurtosis(x)) 
+any(abs(skew.mother)>2 )
+any(abs(kurt.mother)>7)
+col_check=c("Age.ses.3","InterSessions.days","Total.Digits.WAIS.ses.3","meanEulerNumber.ses.3","meanEulerNumber.ses.4")
+skew.control = sapply(main.wide[main.wide$Group=="control",col_check], function(x) skewness(x,na.rm = T)) 
+kurt.control = sapply(main.wide[main.wide$Group=="control",col_check], function(x) kurtosis(x,na.rm=T)) 
+any(abs(skew.control)>2 )
+any(abs(skew.control)>7)
+which(sapply(col_check, function(x) var.test(main.wide[[x]]~main.wide$Group,data=main.wide)$p.value)<0.05 )
+```
+
+```{r SM_TableI_main}
+demo_main = main.wide %>%
+  select(Group,Age.ses.3,PrgWeeks,GestationalBirthWeeks,BirthType,
+         PostPartum.days,InterSessions.days,PostPartum.pc,Education,Total.Digits.WAIS.ses.3,meanEulerNumber.ses.3,meanEulerNumber.ses.4)%>%
+  mutate_at(vars(Group),funs(plyr::revalue(.,c("control"="Controls", "mother"="Mothers"))))%>%
+  tbl_summary(
+    by = "Group",
+    type = list(c(Age.ses.3,PrgWeeks,GestationalBirthWeeks,PostPartum.days,InterSessions.days,PostPartum.pc,Total.Digits.WAIS.ses.3,meanEulerNumber.ses.3,meanEulerNumber.ses.4) ~ "continuous2",
+                all_categorical()~"categorical"),
+    statistic = list(all_continuous() ~ c("{mean} ({sd})","{min}-{max}"),
+                     all_categorical() ~ "{n} ({p}%)",
+                     PostPartum.days ~ c("{mean} ({sd})","{median} ({p25}, {p75})","{min}, {max}")),
+    digits = all_continuous() ~ 2,
+    label = list(Age.ses.3~"Age at pregnancy session [years]",
+                 PrgWeeks~"Gestational weeks at pregnancy session [weeks]",
+                 GestationalBirthWeeks~"Gestational weeks at parturition [weeks]",
+                 PostPartum.days~"Postpartum time [days]",
+                 InterSessions.days~"Time between sessions [days]",
+                 PostPartum.pc~"Percentage of postpartum time between sessions",
+                 Education~"Education [nº of participants (%)]",
+                 BirthType~"Type of parturition [nº of participants (%)]",
+                 Total.Digits.WAIS.ses.3~"Estimated IQ (WAIS-IV Digits Span)"),
+    missing = "no"  )  
+```
+
+```{r MethodsComparison_group.Main}
+t.test(Age.ses.3~Group,main.wide,var.equal=T)
+t.test(InterSessions.days~Group,main.wide,var.equal=T)
+t.test(Total.Digits.WAIS.ses.3~Group,main.wide,var.equal=T)
+t.test(meanEulerNumber.ses.3~Group,main.wide,var.equal=T)
+t.test(meanEulerNumber.ses.4~Group,main.wide,var.equal=T)
+chisq.test(table(main.wide$Education,main.wide$Group))
+t.test(EstimatedTotalIntraCranialVol.ses.3~Group,main.wide,var.equal=T)
+```
+
+```{r MethodsComparison_labor.Main}
+col_check=c("Age.ses.3","PrgWeeks","GestationalBirthWeeks","PostPartum.days","InterSessions.days","PostPartum.pc","PostPartum.pc","Total.Digits.WAIS.ses.3","meanEulerNumber.ses.3","meanEulerNumber.ses.4")
+skew.l = sapply(main.wide[main.wide$labor=="Labor"&main.wide$Group=="mother",col_check], function(x) skewness(x))
+kurt.l = sapply(main.wide[main.wide$labor=="Labor"&main.wide$Group=="mother",col_check], function(x) kurtosis(x)) 
+any(abs(skew.l)>2 )
+any(abs(kurt.l)>7)
+skew.nl = sapply(main.wide[main.wide$labor=="Non-Labor"&main.wide$Group=="mother",col_check], function(x) skewness(x,na.rm = T)) 
+kurt.nl = sapply(main.wide[main.wide$labor=="Non-Labor"&main.wide$Group=="mother",col_check], function(x) kurtosis(x,na.rm=T)) 
+any(abs(skew.nl)>2 )
+any(abs(skew.nl)>7)
+which(sapply(col_check, function(x) var.test(main.wide[[x]]~main.wide$labor,data=main.wide%>%filter(Group=="mother"))$p.value)<0.05 )
+
+t.test(Age.ses.3~labor,main.wide%>%filter(Group=="mother"),var.equal=T)
+t.test(InterSessions.days~labor,main.wide%>%filter(Group=="mother"),var.equal=T)
+t.test(Total.Digits.WAIS.ses.3~labor,main.wide%>%filter(Group=="mother"),var.equal=T)
+t.test(PrgWeeks~labor,main.wide%>%filter(Group=="mother"),var.equal=F)
+t.test(GestationalBirthWeeks~labor,main.wide%>%filter(Group=="mother"),var.equal=T)
+t.test(PostPartum.days~labor,main.wide%>%filter(Group=="mother"),var.equal=T)
+t.test(PostPartum.pc~labor,main.wide%>%filter(Group=="mother"),var.equal=T)
+t.test(meanEulerNumber.ses.3~labor,main.wide%>%filter(Group=="mother"),var.equal=T)
+t.test(meanEulerNumber.ses.4~labor,main.wide%>%filter(Group=="mother"),var.equal=T)
+chisq.test(table(main.wide$Education,main.wide$labor))
+```
+
+
+Replication Dataset.
+
+```{r assumptions_Repl}
+col_check=c("Age.ses.3","PrgWeeks","GestationalBirthWeeks","PostPartum.days","InterSessions.days","PostPartum.pc","Total.Digits.WAIS.ses.3","meanEulerNumber.ses.3","meanEulerNumber.ses.4")
+skew.mother = sapply(repl.wide[repl.wide$Group=="mother",col_check], function(x) skewness(x))
+kurt.mother = sapply(repl.wide[repl.wide$Group=="mother",col_check], function(x) kurtosis(x)) 
+any(abs(skew.mother)>2 )
+any(abs(kurt.mother)>7)
+col_check=c("Age.ses.3","InterSessions.days","Total.Digits.WAIS.ses.3","meanEulerNumber.ses.3","meanEulerNumber.ses.4")
+skew.control = sapply(repl.wide[repl.wide$Group=="control",col_check], function(x) skewness(x,na.rm = T)) 
+kurt.control = sapply(repl.wide[repl.wide$Group=="control",col_check], function(x) kurtosis(x,na.rm=T)) 
+any(abs(skew.control)>2 )
+any(abs(kurt.control)>7)
+which(sapply(col_check, function(x) var.test(repl.wide[[x]]~repl.wide$Group,data=repl.wide)$p.value)<0.05 )
+```
+
+```{r SMTableI_repl}
+demo_repl <- repl.wide %>%
+  select(Group,Age.ses.3,PrgWeeks,GestationalBirthWeeks,BirthType,
+         PostPartum.days,InterSessions.days,PostPartum.pc,Education,Total.Digits.WAIS.ses.3,meanEulerNumber.ses.3,meanEulerNumber.ses.4)%>%
+  mutate_at(vars(Group),funs(plyr::revalue(.,c("control"="Controls", "mother"="Mothers"))))%>%
+  tbl_summary(
+    by = "Group",
+    type = list(c(Age.ses.3,PrgWeeks,GestationalBirthWeeks,
+                  PostPartum.days,InterSessions.days,PostPartum.pc,Total.Digits.WAIS.ses.3,meanEulerNumber.ses.3,meanEulerNumber.ses.4) ~ "continuous2",
+                all_categorical()~"categorical"),
+    statistic = list(all_continuous() ~ c("{mean} ({sd})","{min}-{max}"),
+                     all_categorical() ~ "{n} ({p}%)",
+                     PostPartum.days ~ c("{mean} ({sd})","{median} ({p25}, {p75})","{min}, {max}")),
+    digits = all_continuous() ~ 2,
+    label = list(Age.ses.3~"Age at pregnancy session [years]",
+                 PrgWeeks~"Gestational weeks at pregnancy session [weeks]",
+                 GestationalBirthWeeks~"Gestational weeks at parturition [weeks]",
+                 PostPartum.days~"Postpartum time [days]",
+                 InterSessions.days~"Time between sessions [days]",
+                 PostPartum.pc~"Percentage of postpartum time between sessions",
+                 Education~"Education [nº of participants (%)]",
+                 BirthType~"Type of parturition [nº of participants (%)]",
+                 Total.Digits.WAIS.ses.3~"Estimated IQ (WAIS-IV Digits Span)"),
+    missing = "no"  ) 
+```
+
+```{r MethodsComparison_group.Repl}
+t.test(Age.ses.3~Group,repl.wide,var.equal=T)
+t.test(InterSessions.days~Group,repl.wide,var.equal=T)
+t.test(Total.Digits.WAIS.ses.3~Group,repl.wide,var.equal=T)
+t.test(meanEulerNumber.ses.3~Group,repl.wide,var.equal=T)
+t.test(meanEulerNumber.ses.4~Group,repl.wide,var.equal=T)
+
+chisq.test(table(repl.wide$Education,repl.wide$Group))
+```
+
+```{r SMTableI}
+TableI=tbl_merge(
+  tbls = list(demo_main, demo_repl),
+  tab_spanner = c("**Main Dataset**", "**Replication Dataset**"))
+```
+
+```{r SMTableI_latex}
+sm1 = TableI%>%as_gt() %>%
+  gt::as_latex()
+sm1=sm1[1]
+sm1 = str_replace(sm1,"NA (NA)","")
+sm1 = str_replace(sm1,"Inf, -Inf","")
+writeLines(sm1, 'SMTableI.tex')
+```
+
+```{r SMTable1_footnote}
+cols = c("Age.ses.3","PrgWeeks","GestationalBirthWeeks","PostPartum.days","InterSessions.days","PostPartum.pc","Total.Digits.WAIS.ses.3","meanEulerNumber.ses.3","meanEulerNumber.ses.4")
+
+data.wide=bind_rows(main.wide,repl.wide)
+# Beetween datasets
+var.test(Age.ses.3~Dataset,data=data.wide)
+t.test(Age.ses.3 ~ Dataset, data.wide,var.equal=T)
+var.test(InterSessions.days~Dataset,data=data.wide)
+t.test(InterSessions.days ~ Dataset, data.wide,var.equal=T)
+var.test(Total.Digits.WAIS.ses.3~Dataset,data=data.wide)
+t.test(Total.Digits.WAIS.ses.3 ~ Dataset, data.wide,var.equal=T)
+# var.test(meanEulerNumber.ses.3~Dataset,data=data.wide)
+# t.test(meanEulerNumber.ses.3 ~ Dataset, data.wide,var.equal=T)
+# var.test(meanEulerNumber.ses.4~Dataset,data=data.wide)
+# t.test(meanEulerNumber.ses.4 ~ Dataset, data.wide,var.equal=T)
+chisq.test(table(data.wide$Education,data.wide$Dataset))
+# BEtween mothers' datasets
+which(sapply(cols, function(x) var.test(data.wide[[x]]~data.wide$Dataset,data=data.wide%>%filter(Group=="mother"))$p.value)<0.05 )
+t.test(PrgWeeks~Dataset,data=data.wide%>%filter(Group=="mother"),var.equal=T)
+t.test(GestationalBirthWeeks~Dataset,data=data.wide%>%filter(Group=="mother"),var.equal=F)
+t.test(PostPartum.pc~Dataset,data=data.wide%>%filter(Group=="mother"),var.equal=T)
+wilcox.test(PostPartum.days~Dataset,data=data.wide%>%filter(Group=="mother"))
+chisq.test(table(data.wide$BirthType[data.wide$Group=="mother"],data.wide$Dataset[data.wide$Group=="mother"]))
+```
+
+
+## Results
+
+### Cross-sectional and longitudinal  GM cortical differences
+
+```{r global_assumptions}
+col_check=c("CV.ses.3","CV.ses.4","CV.PrgToPost","CT.ses.3","CT.ses.4","CT.PrgToPost","SA.ses.3","SA.ses.4","SA.PrgToPost")
+#Main
+skew.mother = sapply(main.wide[main.wide$Group=="mother",col_check], function(x) skewness(x))
+kurt.mother = sapply(main.wide[main.wide$Group=="mother",col_check], function(x) kurtosis(x)) 
+any(abs(skew.mother)>2 )
+any(abs(kurt.mother)>7)
+skew.control = sapply(main.wide[main.wide$Group=="control",col_check], function(x) skewness(x,na.rm = T)) 
+kurt.control = sapply(main.wide[main.wide$Group=="control",col_check], function(x) kurtosis(x,na.rm=T)) 
+any(abs(skew.control)>2 )
+any(abs(kurt.control)>7)
+which(sapply(col_check, function(x) var.test(main.wide[[x]]~main.wide$Group,data=main.wide)$p.value)<0.05 )
+
+# Replication
+skew.mother = sapply(repl.wide[repl.wide$Group=="mother",col_check], function(x) skewness(x))
+kurt.mother = sapply(repl.wide[repl.wide$Group=="mother",col_check], function(x) kurtosis(x)) 
+any(abs(skew.mother)>2 )
+any(abs(kurt.mother)>7)
+skew.control = sapply(repl.wide[repl.wide$Group=="control",col_check], function(x) skewness(x,na.rm = T)) 
+kurt.control = sapply(repl.wide[repl.wide$Group=="control",col_check], function(x) kurtosis(x,na.rm=T)) 
+any(abs(skew.control)>2 )
+any(abs(kurt.control)>7)
+which(sapply(col_check, function(x) var.test(repl.wide[[x]]~repl.wide$Group,data=repl.wide)$p.value)<0.05 )
+```
+
+```{r data4lme}
+aux = main.wide%>%
+  select(ID,Group,CV.ses.3,CV.ses.4,CT.ses.3,CT.ses.4,SA.ses.3,SA.ses.4)%>%
+  mutate(CV.ses.3=CV.ses.3/1000,
+         CV.ses.4=CV.ses.4/1000,
+         SA.ses.3=SA.ses.3/100,
+         SA.ses.4=SA.ses.4/100)
+aux.long =melt(aux, id.vars = c("ID","Group"), variable.name = "measure")%>%
+  mutate(ses=as.factor(str_sub(measure,4,length(measure))),
+         measure=str_sub(measure,1,2))%>%
+  mutate_at(vars(measure),funs(
+    forcats::fct_relevel(.,c("CV","CT","SA"))))%>%
+  mutate_at(vars(ses),funs(
+    forcats::fct_relevel(.,c("ses.3","ses.4"))))%>%
+  arrange(ID)
+```
+
+**Supplementary Table II:** Descriptives and group comparison statistics of the global differences in
+cortical metrics at Pregnancy session (“Prg”), Postpartum session (“Post”), and “Prg-to-Post” in mothers and nulliparous women (“Controls”).
+
+```{r TableSMII}
+descriptives_sm2.long = aux.long%>%
+    group_by(measure,ses,Group) %>%
+  summarize(#`Mean (SD)`=paste0(round(mean(value),2)," (",round(sd(value),2),")"),
+    Mean = round(mean(value),2),SD=round(sd(value),2))
+descriptives_sm2.long = melt(descriptives_sm2.long,id.vars = c("Group","measure","ses"),variable.name = "statistic")
+descriptives_sm2 = dcast(descriptives_sm2.long,measure+statistic~Group*ses,value.var="value")
+
+C = matrix(c(0,1,0,0,
+             0,1,0,1,
+             0,0,0,1),nrow=3,byrow=T)
+con_name=c("Prg","Post","Group*Session")
+stats_sm2 = as.data.frame(matrix(,nrow=2*3,ncol=7))
+names(stats_sm2)=c("measure","contrast","Fstatistic","uncP","dfWithin","dfBetween","sgn")
+cont=0
+for (meas in c("CV","CT","SA")){
+  for (con in seq(1:3)){
+    cont=cont+1
+    ni = matrix(unname(table(aux.long$ID[aux.long$measure==meas])), ncol=1)
+    X = model.matrix(~Group*ses, aux.long%>%filter(measure==meas))
+    Y = aux.long%>%filter(measure==meas)%>%select(value)%>%as.matrix()
+    stats <- lme_fit_FS(X, Zcols=c(1), Y , ni)
+    F_C <- lme_F(stats, matrix(C[con,],nrow=1))
+    stats_sm2[cont,] = c(meas,con_name[con],F_C$F[1],F_C$pval[1],F_C$df[1:2],F_C$sgn)
+  }
+}
+stats_sm2 = stats_sm2 %>% 
+  mutate_at(c("Fstatistic","uncP","dfWithin","dfBetween","sgn"), as.numeric)%>%
+  mutate(partial_etaSq = Fstatistic*dfWithin/(Fstatistic*dfWithin+dfBetween),
+         fdr=p.adjust(uncP,method="fdr"),
+         fdr_signif=ifelse(fdr<0.05,"*",""),
+         sgn_effect=round(sgn*partial_etaSq,4),
+         label=paste0(format(round(sgn_effect,3),nsmall = 3),fdr_signif),
+         Fstatistic=format(round(Fstatistic, 2), nsmall = 2),
+         dfBetween=format(round(dfBetween, 2), nsmall = 2),
+         uncP=ifelse(uncP<0.0001,"<0.0001",format(round(uncP, 4), nsmall = 4)),
+         uncP=paste0(uncP,fdr_signif),
+         df = paste0(dfWithin, ", ", dfBetween))
+
+stats_sm2.long = melt(stats_sm2%>%select(measure,contrast,Fstatistic,df,uncP,sgn_effect),id.vars = c("measure","contrast"),variable.name = "statistic")
+stats_sm2.long = dcast(stats_sm2.long, measure+statistic~contrast,value.var="value")
+
+sm2 = merge(descriptives_sm2,stats_sm2.long,by=c("measure","statistic"),all=T)%>%
+  left_join(data.frame(measure = c("CV","CT","SA")),.,meaure = "measure")%>%
+  mutate(statistic = case_when(statistic == "Mean" ~ "Mean",
+                               statistic == "SD" ~ "Standard deviation",
+                               statistic == "Fstatistic" ~ "F-statistic",
+                               statistic == "uncP" ~ "Uncorrected p-value",
+                               statistic == "df" ~ "Degrees of freedom",
+                               statistic == "sgn_effect" ~ "Signed effect size"),
+         measure = case_when(measure == "CV" ~ "Cortical Volume  [cm$^3$]",
+                             measure == "CT" ~ "Cortical Thickness [mm]",
+                             measure == "SA" ~ "Surface Area [cm$^2$]"))%>%
+  select(measure, statistic, control_ses.3, control_ses.4, mother_ses.3, mother_ses.4,
+         Prg, Post,`Group*Session`)
+
+sm2_latex = knitr::kable(sm2, format = 'latex',escape=FALSE, col.names=c("","",rep(c("Prg","Post"),3),"Group*Session"),booktabs=F) %>%
+  add_header_above(c("measure/statistic" = 2, "Controls, N=34" = 2, "Mothers, N=110" = 2, "Group differences" = 3))
+```
+
+
+##### Cross-sectional
+
+**Figure 1**: Group differences in cortical volume, thickness, and surface area in mothers (N=110) compared to nulliparous women (“Controls”, N=34) at late pregnancy (“Prg”) and early postpartum (“Post”) sessions. Group fixed effects at each session were studied through the adjusted linear mixed model $Cortical\ Metric \sim 1 + Group + Session + Group \times Session + (1 | P articipant)$. (a) Distribution of the global cortical metrics at “Prg” and “Post” sessions in mothers and controls. Effect sizes of the group differences at “Prg” and “Post” sessions were calculated
+as the signed partial eta squared ($\eta^{2}_{p}$) associated to the correspondent Wald F-tests. Asterisks indicate those differences surviving a p<0.05 False Discovery Rate (FDR) correction.
+
+```{r Fig1a}
+size.axis=60
+size.effects = 11.5
+size.labs=70
+col.ctr = "lightgray"
+col.exp = "darkgray"
+
+
+CV=ggplot(aux.long%>%filter(measure=="CV"))+aes(x=ses,y=value,fill=Group,color=Group)+
+  # introdataviz::geom_split_violin(alpha = .6, trim = FALSE,lwd=0.7) +
+  geom_split_violin(trim = FALSE,lwd=1) +
+  geom_boxplot(width = .3, alpha = .1, show.legend = FALSE,outlier.shape = 18,
+               outlier.alpha = 1,lwd=1) +
+  scale_x_discrete(name = "", labels = c("Prg", "Post")) +
+  scale_y_continuous(name = "",#TeX("\\textbf{Cortical Volume ($cm^3$)}"),
+                     breaks = seq(350, 550, 100),
+                     limits = c(330, 600)) +
+  scale_fill_manual(values = c(col.ctr,col.exp), name = "") +
+  scale_color_manual(values = c("black","black"), name = "") +
+  theme_bw()+
+  theme(axis.title.y = element_text(face="bold", color="black",size=size.labs),
+        axis.text.x = element_text(face="bold", color="black",size=size.axis),
+        axis.text.y = element_text( color="black",size=size.axis))+
+  annotate("label",y = 597,x=1:2, label = TeX(paste0("$\\eta_{p}^{2}=$",stats_sm2$label[stats_sm2$measure=="CV"&stats_sm2$contrast!="Group*Session"])),size=size.effects)
+
+
+CT=ggplot(aux.long%>%filter(measure=="CT"))+aes(x=ses,y=value,fill=Group,color=Group)+
+  geom_split_violin( trim = FALSE,lwd=1) +
+  geom_boxplot(width = .3, alpha = .1, show.legend = FALSE,outlier.shape = 18,
+               outlier.alpha = 1,lwd=1) +
+  scale_x_discrete(name = "", labels = c("Prg", "Post")) +
+  scale_y_continuous(name = "",#TeX("\\textbf{Cortical Thickness ($mm$)}"),
+                     breaks = seq(2.1, 2.85, 0.3),
+                     limits = c(2.1, 2.82)) +
+  scale_fill_manual(values = c(col.ctr,col.exp), name = "") +
+  scale_color_manual(values = c("black","black"), name = "") +
+  theme_bw()+
+  theme(axis.title.y = element_text(face="bold", color="black",size=size.labs),
+        axis.text.x = element_text(face="bold", color="black",size=size.axis),
+        axis.text.y = element_text( color="black",size=size.axis))+
+  annotate("label",y = 2.81,x=1:2, label = TeX(paste0("$\\eta_{p}^{2}=$",stats_sm2$label[stats_sm2$measure=="CT"&stats_sm2$contrast!="Group*Session"])),size=size.effects)
+
+SA=ggplot(aux.long%>%filter(measure=="SA"))+aes(x=ses,y=value,fill=Group,color=Group)+
+  geom_split_violin(trim = FALSE,lwd=1) +
+  geom_boxplot(width = .3, alpha = .1, show.legend = FALSE,outlier.shape = 18,
+               outlier.alpha = 1,lwd=1) +
+  scale_x_discrete(name = "", labels = c("Prg", "Post")) +
+  scale_y_continuous(name = "",#TeX("\\textbf{Surface Area ($cm^2$)}"),
+                     breaks = seq(1300, 2220, 300),
+                     limits = c(1250, 2220)) +
+  scale_fill_manual(values = c(col.ctr,col.exp), name = "") +
+  scale_color_manual(values = c("black","black"), name = "") +
+  theme_bw()+
+  theme(axis.title.y = element_text(face="bold", color="black",size=size.labs),
+        axis.text.x = element_text(face="bold", color="black",size=size.axis),
+        axis.text.y = element_text( color="black",size=size.axis))+
+  annotate("label",y = 2190,x=1:2, label = TeX(paste0("$\\eta_{p}^{2}=$",stats_sm2$label[stats_sm2$measure=="SA"&stats_sm2$contrast!="Group*Session"])),size=size.effects)
+```
+
+```{r save_Fig1a}
+png(paste0(fig_path,"/Fig_1a_CV.png"), width = 220, height = 220, units='mm', res = 300)
+CV+theme(legend.position = "none")
+dev.off()
+png(paste0(fig_path,"/Fig_1a_CT.png"), width = 220, height = 220, units='mm', res = 300)
+CT+theme(legend.position = "none")
+dev.off()
+png(paste0(fig_path,"/Fig_1a_SA.png"), width = 220, height = 220, units='mm', res = 300)
+SA+theme(legend.position = "none")
+dev.off()
+```
+
+
+#### Longitudinal
+ 
+**Figure 2:** Longitudinal changes in cortical volume, thickness, and surface area from late pregnancy to early postpartum in mothers (N=110) compared to nulliparous women (“Controls”, N=34). Longitudinal changes were derived from the group*session interaction fixed effect term of the adjusted linear mixed model:$Cortical\ Metric \sim 1 + Group + Session + Group \times Session + (1 | P articipant)$.
+
+**(a)** Distribution of the percentage of change of the global metrics in mothers and controls. Effect sizes were calculated as the signed partial eta squared ($eta^{2}_{p}) associated with the correspon-
+dent Wald F-tests. Asterisks indicate those changes surviving a p<0.05 False Discovery Rate (FDR) correction.
+
+```{r data4longplot}
+aux.pch = main.wide%>%
+  select(ID,Group,BirthType,labor,contains("PrgToPost"),PostPartum.pc)
+aux.pch.long <- reshape2::melt(aux.pch, id.vars = c("ID","Group","labor","BirthType","PostPartum.pc"), variable.name = "measure")%>%
+  arrange(ID)
+```
+
+```{r Fig2a}
+CV = ggplot(aux.pch.long%>%filter(measure=="CV.PrgToPost"))+
+  aes(x=1,y=value,fill=Group,color=Group)+
+  geom_split_violin(trim = FALSE,lwd=1) +
+  geom_boxplot(width = .3, alpha = .1, show.legend = FALSE,outlier.shape = 18,
+               outlier.alpha = 1,lwd=1) +
+  scale_y_continuous(name = "% of change",
+                     breaks = seq(-4, 8, 4),
+                     limits = c(-4.5,8)) +
+  scale_fill_manual(values = c(col.ctr,col.exp), name = "") +
+  scale_color_manual(values = c("black","black"), name = "") +
+  theme_bw()+
+  theme(axis.title.x=element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text = element_text(color="black",size=size.axis),
+        axis.title = element_text(color="black", size=size.labs, face="bold.italic"))+
+  annotate("label",y = 7.9,x=1, label = TeX(paste0("$\\eta_{p}^{2}=$",stats_sm2$label[stats_sm2$measure=="CV"&stats_sm2$contrast=="Group*Session"])),size=size.effects)
+
+CT= ggplot(aux.pch.long%>%filter(measure=="CT.PrgToPost" ))+
+  aes(x=1,y=value,fill=Group,color=Group)+
+  geom_split_violin(trim = FALSE,lwd=1) +
+  geom_boxplot(width = .3, alpha = .1, show.legend = FALSE,
+               outlier.shape = 18,outlier.alpha = 1,lwd=1) +
+  scale_y_continuous(name = "% of change",
+                     breaks = seq(-4, 8, 4),
+                     limits = c(-4.5,8)) +
+  scale_fill_manual(values = c(col.ctr,col.exp), name = "") +
+  scale_color_manual(values = c("black","black"), name = "") +
+  theme_bw()+
+  theme(axis.title.x=element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text = element_text( color="black",size=size.axis),
+        axis.title = element_text(color="black", size=size.labs, face="bold.italic"))+
+  annotate("label",y = 7.9,x=1, label = TeX(paste0("$\\eta_{p}^{2}=$",stats_sm2$label[stats_sm2$measure=="CT"&stats_sm2$contrast=="Group*Session"])),size=size.effects)
+
+SA= ggplot(aux.pch.long%>%filter(measure=="SA.PrgToPost" ))+
+  aes(x=1,y=value,fill=Group,color=Group)+
+  geom_split_violin(trim = FALSE,lwd=1) +
+  geom_boxplot(width = .3, alpha = .1, show.legend = FALSE,
+               outlier.shape = 18,outlier.alpha = 1,lwd=1) +
+  scale_y_continuous(name = "% of change",
+                     breaks = seq(-2, 2.8, 2),
+                     limits = c(-2,2.8) ) +
+  scale_fill_manual(values = c(col.ctr,col.exp), name = "") +
+  scale_color_manual(values = c("black","black"), name = "") +
+  theme_bw()+
+  theme(axis.title.x=element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text = element_text( color="black",size=size.axis),
+        axis.title = element_text(color="black", size=size.labs, face="bold.italic"))+
+  annotate("label",y = 2.75,x=1, label = TeX(paste0("$\\eta_{p}^{2}=$",stats_sm2$label[stats_sm2$measure=="SA"&stats_sm2$contrast=="Group*Session"])),size=size.effects)
+```
+
+```{r save_Fig2a}
+png(paste0(fig_path,"/Fig_2a_CV.png"), width = 220, height = 220, units='mm', res = 300)
+CV+theme(legend.position = "none")
+dev.off()
+png(paste0(fig_path,"/Fig_2a_CT.png"), width = 220, height = 220, units='mm', res = 300)
+CT+theme(legend.position = "none")
+dev.off()
+png(paste0(fig_path,"/Fig_2a_SA.png"), width = 220, height = 220, units='mm', res = 300)
+SA+theme(legend.position = "none")
+dev.off()
+
+```
+
+**(c)** Correlations between the global percentages of change in cortical metrics and the percentage of postpartum time between sessions. The shading on the least squares regression line represents the $95%$ confidence interval. Asterisks indicate Pearson coefficients surviving an FDR-corrected $P<0.05$. 
+
+```{r Rcoef}
+r_WB = aux.pch.long%>%
+  group_by(measure) %>%
+  summarize(cor=cor.test(value,PostPartum.pc,method="pearson")$estimate,
+            p=cor.test(value, PostPartum.pc,method="pearson")$p.value,)%>%
+  mutate(fdr.p=p.adjust(p,method="fdr"),
+         fdr.significance=ifelse(fdr.p<0.05,"*",""),
+         label = paste0("R= ",round(cor,2),
+                        "\np= ",ifelse(p<0.0001,"<0.0001",format(round(p,4),scientific=F)),
+                        fdr.significance))
+r_WB$label = str_replace(r_WB$label, "=<" ,"<" )
+```
+
+```{r Fig2c}
+x_pos=60
+size.point=5
+size.lwd=1.75
+size.point=4
+
+CV = ggplot(aux.pch%>%filter(Group=="mother"))+
+  aes(x=PostPartum.pc,y=CV.PrgToPost)+
+  geom_point(size=size.point,color=col.exp)+
+  geom_smooth(method="lm",se=T,color="black",lwd=size.lwd)+
+  theme_bw()+
+  theme(legend.position = "None")+
+  theme(axis.text = element_text(color="black",size=size.axis),
+        axis.title = element_text(color="black", size=size.labs, face="bold.italic"))+
+  ylab("% of change")+xlab("% Postpartum time")+
+  ylim(-2.5,6)+
+  annotate("label",y = 5.5,x=x_pos, label = r_WB$label[r_WB$measure=="CV.PrgToPost"],
+           hjust=0,size=size.effects)
+
+CT = ggplot(aux.pch%>%filter(Group=="mother"))+
+  aes(x=PostPartum.pc,y=CT.PrgToPost)+
+  geom_point(size=size.point,color=col.exp)+
+  geom_smooth(method="lm",se=T,color="black",lwd=size.lwd)+
+  theme_bw()+
+  theme(legend.position = "None")+
+  theme(axis.text = element_text( color="black",size=size.axis),
+        axis.title = element_text(color="black", size=size.labs, face="bold.italic"))+
+  ylab("% of change")+xlab("% Postpartum time")+
+  ylim(-2.5,6)+
+  annotate("label",y = 5.5,x=x_pos, label = r_WB$label[r_WB$measure=="CT.PrgToPost"], hjust=0,color="black",size=size.effects)
+
+SA = ggplot(aux.pch%>%filter(Group=="mother"))+
+  aes(x=PostPartum.pc,y=SA.PrgToPost)+
+  geom_point(size=size.point,color=col.exp)+
+  geom_smooth(method="lm",se=T,color="black",lwd=size.lwd)+
+  theme_bw()+
+  theme(legend.position = "None")+
+  theme(axis.text = element_text(color="black",size=size.axis),
+        axis.title = element_text(color="black", size=size.labs, face="bold.italic"))+
+  ylab("% of change")+xlab("% Postpartum time")+
+  ylim(-2,2.5)+
+  annotate("label",y = 2.25,x=x_pos, label = r_WB$label[r_WB$measure=="SA.PrgToPost"], hjust=0,color="black",size=size.effects)
+```
+
+```{r save_Fig2c}
+png(paste0(fig_path,"/Fig_2c_CV.png"), width = 280, height = 220, units='mm', res = 300)
+CV+theme(legend.position = "none")
+dev.off()
+png(paste0(fig_path,"/Fig_2c_CT.png"), width = 280, height = 220, units='mm', res = 300)
+CT+theme(legend.position = "none")
+dev.off()
+png(paste0(fig_path,"/Fig_2c_SA.png"), width = 280, height = 220, units='mm', res = 300)
+SA+theme(legend.position = "none")
+dev.off()
+
+```
+
+
+#### Supplementary Analysis
+
+##### Confoundings
+
+```{r data4smtables}
+aux.long1 =melt(main.wide%>%
+  select(ID,Group,CV.ses.3,CV.ses.4,CT.ses.3,CT.ses.4,SA.ses.3,SA.ses.4, Age.ses.3,EstimatedTotalIntraCranialVol.ses.3), id.vars = c("ID","Group","Age.ses.3","EstimatedTotalIntraCranialVol.ses.3"), variable.name = "measure")%>%
+  mutate(ses=as.factor(str_sub(measure,4,length(measure))),
+         measure=str_sub(measure,1,2))%>%
+  arrange(ID)
+aux.long2 =melt(main.wide%>%select(ID,Group,meanEulerNumber.ses.3,meanEulerNumber.ses.4), id.vars = c("ID","Group"), variable.name = "ses",value.name = "meanEulerNumber")%>%
+  mutate(ses=str_replace(ses,"meanEulerNumber.",""))%>%
+  arrange(ID)
+aux.long3 =melt(main.wide%>%select(ID,Group,Total.PSQI.ses.3,Total.PSQI.ses.4), id.vars = c("ID","Group"), variable.name = "ses",value.name = "Total.PSQI")%>%
+  mutate(ses=str_replace(ses,"Total.PSQI.",""))%>%
+  arrange(ID)
+aux.long4 =melt(main.wide%>%select(ID,Group,Total.PSS.14.ses.3,Total.PSS.14.ses.4), id.vars = c("ID","Group"), variable.name = "ses",value.name = "Total.PSS")%>%
+  mutate(ses=str_replace(ses,"Total.PSS.14.",""))%>%
+  arrange(ID)
+
+aux.long = merge(aux.long1,aux.long2,by=c("ID","Group","ses"))%>%
+  merge(.,aux.long3,by=c("ID","Group","ses"),all=T)%>%
+  merge(.,aux.long4,by=c("ID","Group","ses"),all=T)
+```
+
+**Supplementary Table 6:** Group comparison statistics of the global differences in cortical metrics at Pregnancy session (“Prg”), Postpartum session (“Post”), and “Prg-to-Post” in mothers and nulliparous women (“Controls”) accounting for participant’ age, intracranial volume, and mean Euler number.
+
+```{r TableSMVI}
+C = matrix(c(0,1,0,0,0,0,0,
+             0,1,0,0,0,0,1,
+             0,0,0,0,0,0,1),nrow=3,byrow=T)
+con_name=c("Prg","Post","Group*Session")
+stats_sm6 = as.data.frame(matrix(,nrow=3*length(con_name),ncol=7))
+names(stats_sm6)=c("measure","contrast","Fstatistic","uncP","dfWithin","dfBetween","sgn")
+cont=0
+for (meas in c("CV","CT","SA")){
+  for (con in seq(1:length(con_name))){
+    cont=cont+1
+    ni = matrix(unname(table(aux.long$ID[aux.long$measure==meas])), ncol=1)
+    X = model.matrix(~Group*ses+Age.ses.3+EstimatedTotalIntraCranialVol.ses.3+meanEulerNumber, aux.long%>%filter(measure==meas))
+    Y = aux.long%>%filter(measure==meas)%>%select(value)%>%as.matrix()
+    stats <- lme_fit_FS(X, Zcols=c(1), Y , ni)
+    F_C <- lme_F(stats, matrix(C[con,],nrow=1))
+    stats_sm6[cont,] = c(meas,con_name[con],F_C$F[1],F_C$pval[1],F_C$df[1:2],F_C$sgn)
+  }
+}
+stats_sm6 = stats_sm6 %>% 
+  mutate_at(c("Fstatistic","uncP","dfWithin","dfBetween","sgn"), as.numeric)%>%
+  mutate(partial_etaSq = Fstatistic*dfWithin/(Fstatistic*dfWithin+dfBetween),
+         fdr=p.adjust(uncP,method="fdr"),
+         fdr_signif=ifelse(fdr<0.05,"*",""),
+         sgn_effect=round(sgn*partial_etaSq,4),
+         label=paste0(round(sgn_effect,3),fdr_signif),
+         Fstatistic=format(round(Fstatistic, 2), nsmall = 2),
+         dfBetween=format(round(dfBetween, 2), nsmall = 2),
+         uncP=ifelse(uncP<0.0001,"<0.0001",format(round(uncP, 4), nsmall = 4)),
+         uncP=paste0(uncP,fdr_signif),
+         df = paste0(dfWithin, ", ", dfBetween))
+
+stats_sm6.long = melt(stats_sm6%>%select(measure,contrast,Fstatistic,df,uncP,sgn_effect),id.vars = c("measure","contrast"),variable.name = "statistic")
+sm6 = dcast(stats_sm6.long, measure+statistic~contrast,value.var="value")%>%
+  left_join(data.frame(measure = c("CV","CT","SA")),.,meaure = "measure")%>%
+  mutate(statistic = case_when(statistic == "Fstatistic" ~ "F-statistic",
+                               statistic == "uncP" ~ "Uncorrected p-value",
+                               statistic == "df" ~ "Degrees of freedom",
+                               statistic == "sgn_effect" ~ "Signed effect size"),
+         measure = case_when(measure == "CV" ~ "Cortical Volume  [cm$^3$]",
+                             measure == "CT" ~ "Cortical Thickness [mm]",
+                             measure == "SA" ~ "Surface Area [cm$^2$]"))%>%
+  select(measure, statistic, Prg, Post,`Group*Session`)
+
+sm6_latex = knitr::kable(sm6, format = 'latex',escape=FALSE,booktabs=F)
+```
+
+**Supplementary Table 7:** Group comparison statistics of the global differences in cortical metrics at Pregnancy session (“Prg”), Postpartum session (“Post”), and “Prg-to-Post” in mothers and nulliparous women (“Controls”) accounting for participant’ age, intracranial volume, mean Euler number, sleep quality, and stress levels. 
+
+```{r TableSMVII}
+C = matrix(c(0,1,0,0,0,0,0,0,0,
+             0,1,0,0,0,0,0,0,1,
+             0,0,0,0,0,0,0,0,1),nrow=3,byrow=T)
+con_name=c("Prg","Post","Group*Session")
+stats_sm7 = as.data.frame(matrix(,nrow=3*length(con_name),ncol=7))
+names(stats_sm7)=c("measure","contrast","Fstatistic","uncP","dfWithin","dfBetween","sgn")
+cont=0
+for (meas in c("CV","CT","SA")){
+  for (con in seq(1:length(con_name))){
+    cont=cont+1
+    ni = matrix(unname(table(aux.long$ID[aux.long$measure==meas])), ncol=1)
+    X = model.matrix(~Group*ses+Age.ses.3+EstimatedTotalIntraCranialVol.ses.3+meanEulerNumber+Total.PSQI+Total.PSS, aux.long%>%filter(measure==meas))
+    Y = aux.long%>%filter(measure==meas)%>%select(value)%>%as.matrix()
+    stats <- lme_fit_FS(X, Zcols=c(1), Y , ni)
+    F_C <- lme_F(stats, matrix(C[con,],nrow=1))
+    stats_sm7[cont,] = c(meas,con_name[con],F_C$F[1],F_C$pval[1],F_C$df[1:2],F_C$sgn)
+  }
+}
+stats_sm7 = stats_sm7 %>% 
+  mutate_at(c("Fstatistic","uncP","dfWithin","dfBetween","sgn"), as.numeric)%>%
+  mutate(partial_etaSq = Fstatistic*dfWithin/(Fstatistic*dfWithin+dfBetween),
+         fdr=p.adjust(uncP,method="fdr"),
+         fdr_signif=ifelse(fdr<0.05,"*",""),
+         sgn_effect=round(sgn*partial_etaSq,4),
+         label=paste0(round(sgn_effect,3),fdr_signif),
+         Fstatistic=format(round(Fstatistic, 2), nsmall = 2),
+         dfBetween=format(round(dfBetween, 2), nsmall = 2),
+         uncP=ifelse(uncP<0.0001,"<0.0001",format(round(uncP, 4), nsmall = 4)),
+         uncP=paste0(uncP,fdr_signif),
+         df = paste0(dfWithin, ", ", dfBetween))
+
+stats_sm7.long = melt(stats_sm7%>%select(measure,contrast,Fstatistic,df,uncP,sgn_effect),id.vars = c("measure","contrast"),variable.name = "statistic")
+sm7 = dcast(stats_sm7.long, measure+statistic~contrast,value.var="value")%>%
+  left_join(data.frame(measure = c("CV","CT","SA")),.,meaure = "measure")%>%
+  mutate(statistic = case_when(statistic == "Fstatistic" ~ "F-statistic",
+                               statistic == "uncP" ~ "Uncorrected p-value",
+                               statistic == "df" ~ "Degrees of freedom",
+                               statistic == "sgn_effect" ~ "Signed effect size"),
+         measure = case_when(measure == "CV" ~ "Cortical Volume  [cm$^3$]",
+                             measure == "CT" ~ "Cortical Thickness [mm]",
+                             measure == "SA" ~ "Surface Area [cm$^2$]"))%>%
+  select(measure, statistic, Prg, Post,`Group*Session`)
+
+sm7_latex = knitr::kable(sm7, format = 'latex',escape=FALSE,booktabs=F)
+```
+
+##### Replication sample
+
+```{r data4repl}
+data.wide=bind_rows(main.wide,repl.wide)
+data.wide2 = data.wide%>%select("ID","Group","labor","BirthType","PostPartum.pc","Dataset",contains("CV"),contains("CT"),contains("SA"))
+aux.long <- melt(data.wide2, 
+                           id.vars = c("ID","Group","labor","BirthType","PostPartum.pc","Dataset"),
+                           variable.name = "measure")%>%
+  mutate(ses=str_sub(measure,4,length(measure)),
+         measure=str_sub(measure,1,2),
+         Dataset=factor(Dataset))%>%
+  arrange(ID)
+```
+
+**Figure 4:** Comparison of the results between the main (110 mothers and 34 nulliparous women
+(“Controls”)) and replication (29 mothers and 24 controls) datasets.
+
+**(c)**Correlations between the global percentages of change in cortical metrics and the percentage of postpartum time between sessions in the main (green) and replication (pink) datasets. The shading on the least squares regression line represents the 95% confidence interval. Asterisks indicate Pearson coefficients (R) surviving an FDR-corrected p$<$0.05.
+
+```{r Rcoef_replication}
+r_WB = aux.long%>%
+  filter(Group=="mother")%>%
+  filter(ses=="PrgToPost")%>%
+  group_by(measure,Dataset) %>%
+  summarize(cor=cor.test(value,PostPartum.pc,method="pearson")$estimate,
+            p=cor.test(value, PostPartum.pc,method="pearson")$p.value)
+# FDR-correction is applied separately
+r_WB$fdr[r_WB$Dataset=="Main Data"] = p.adjust(r_WB$p[r_WB$Dataset=="Main Data"],"fdr")
+r_WB$fdr[r_WB$Dataset!="Main Data"] = p.adjust(r_WB$p[r_WB$Dataset!="Main Data"],"fdr")
+r_WB$label = 
+  paste0(r_WB$Dataset,"\nR= ",round(r_WB$cor,2),
+         ifelse(r_WB$fdr<=0.05,"*",""),
+         "\np= ",ifelse(r_WB$p<0.0001,"<0.0001",as.character(round(r_WB$p,3))))
+r_WB$label = str_replace(r_WB$label, "=<" ,"<" )
+```
+
+```{r Fig4}
+col_repl='#ff2d96'
+col_main='#4BAF82' #'#00d269'
+size.point=4
+size.ax = 30
+size.lab = 35
+size.leg = 30
+
+CV = ggplot(aux.long%>%filter(Group=="mother",measure=="CV",ses=="PrgToPost"))+
+  aes(x=PostPartum.pc,y=value,colour=Dataset,fill=Dataset)+
+  geom_point(size=size.point)+
+  geom_smooth(method="lm",se=T,show.legend=F,alpha=0.2,lwd=size.lwd)+
+  theme_bw()+
+  theme(legend.position="top")+
+  guides(color = guide_legend(override.aes = list(size=7)))+
+  theme(legend.background = element_rect( linetype="solid",colour ="black"))+
+  theme(axis.text = element_text( color="black",size=size.ax),
+        axis.title = element_text(color="black", size=size.lab, face="bold.italic"),
+        legend.text=element_text(size=size.leg))+
+  ylab("% of change \n Cortical Volume")+
+  xlab("% Postpartum time")+
+  ylim(-5,6)+
+  scale_fill_manual(values = c(col_main,col_repl), name = "",labels=r_WB$label[r_WB$measure=="CV"]) +
+  scale_color_manual(values = c(col_main,col_repl), name = "",labels=r_WB$label[r_WB$measure=="CV"]) 
+ 
+CT = ggplot(aux.long%>%filter(Group=="mother",measure=="CT",ses=="PrgToPost"))+
+  aes(x=PostPartum.pc,y=value,colour=Dataset,fill=Dataset)+
+  geom_point(size=size.point)+
+  geom_smooth(method="lm",se=T,show.legend=F,alpha=0.2,lwd=size.lwd)+
+  theme_bw()+
+  theme(legend.position="top")+
+  guides(color = guide_legend(override.aes = list(size=7)))+
+  theme(legend.background = element_rect( linetype="solid",colour ="black"))+
+  theme(axis.text = element_text( color="black",size=size.ax),
+        axis.title = element_text(color="black", size=size.lab, face="bold.italic"),
+        legend.text=element_text(size=size.leg))+
+  ylab("% of change \n Cortical Thickness")+
+  xlab("% Postpartum time")+
+  ylim(-5,6)+
+  scale_fill_manual(values = c(col_main,col_repl), name = "",labels=r_WB$label[r_WB$measure=="CT"]) +
+  scale_color_manual(values = c(col_main,col_repl), name = "",labels=r_WB$label[r_WB$measure=="CT"]) 
+
+SA = ggplot(aux.long%>%filter(Group=="mother",measure=="SA",ses=="PrgToPost"))+
+  aes(x=PostPartum.pc,y=value,colour=Dataset,fill=Dataset)+
+  geom_point(size=size.point)+
+  geom_smooth(method="lm",se=T,show.legend=F,alpha=0.2,lwd=size.lwd)+
+  theme_bw()+
+  theme(legend.position="top")+
+  guides(color = guide_legend(override.aes = list(size=7)))+
+  theme(legend.background = element_rect( linetype="solid",colour ="black"))+
+  theme(axis.text = element_text( color="black",size=size.ax),
+        axis.title = element_text(color="black", size=size.lab, face="bold.italic"),
+        legend.text=element_text(size=size.leg))+
+  ylab("% of change \n Surface Area")+
+  xlab("% Postpartum time")+
+  # scale_y_continuous(breaks=seq(-1,2,1))+
+  ylim(-2,2)+
+  scale_fill_manual(values = c(col_main,col_repl), name = "",labels=r_WB$label[r_WB$measure=="SA"]) +
+  scale_color_manual(values = c(col_main,col_repl), name = "",labels=r_WB$label[r_WB$measure=="SA"]) 
+```
+
+```{r save_Fig4c}
+png(paste0(fig_path,"/Fig_4c_CV.png"), width = 220, height = 220, units='mm', res = 300)
+CV
+dev.off()
+png(paste0(fig_path,"/Fig_4c_CT.png"), width = 220, height = 220, units='mm', res = 300)
+CT
+dev.off()
+png(paste0(fig_path,"/Fig_4c_SA.png"), width = 220, height = 220, units='mm', res = 300)
+SA
+dev.off()
+
+```
+
+
+
+### Neuropsychological variables
+
+#### Comparisons.
+
+```{r assumptions}
+# First: 
+col_check = main.wide%>%select(contains("Total"),contains("dif"),-contains("EstimatedTotalIntraCranialVol"))%>%colnames()
+
+skew.mother = sapply(main.wide[main.wide$Group=="mother",col_check], function(x) moments::skewness(x))
+kurt.mother = sapply(main.wide[main.wide$Group=="mother",col_check], function(x) moments::kurtosis(x)) 
+any(abs(skew.mother)>2 )
+any(abs(kurt.mother)>7)
+col_check = main.wide%>%select(contains("PSS"),contains("WAIS"),contains("Total.PSQI"))%>%colnames()
+skew.control = sapply(main.wide[main.wide$Group=="control",col_check], function(x) moments::skewness(x,na.rm = T)) 
+kurt.control = sapply(main.wide[main.wide$Group=="control",col_check], function(x) moments::kurtosis(x,na.rm=T)) 
+any(abs(skew.control)>2 )
+any(abs(skew.control)>7)
+which(sapply(col_check, function(x) var.test(main.wide[[x]]~main.wide$Group,data=main.wide)$p.value)<0.05 )
+
+```
+
+**SM Table VIII:** Mothers’ neuropsychological levels at late pregnancy (“Prg”) and early postpartum (“Post”) sessions.
+
+```{r longitudinal_behavior_mothers}
+n_dec=2
+aux = main.wide%>%
+  select(ID,Group,contains(c("Total.MAS","Total.EDS","Total.PSQI","Total.PSS.14",
+            "Total.PRAS","Total.MSS","Total.BEQ")),-contains("dif"))
+colnames(aux)=str_remove(colnames(aux),"Total.")
+colnames(aux)=str_remove(colnames(aux),".14")
+
+aux.long <- reshape2::melt(aux, id.vars = c("ID","Group"), variable.name = "scale")%>%
+  mutate(ses=ifelse(str_detect(scale,"ses.3"),"ses.3","ses.4"),
+         scale=str_remove_all(scale,pattern = "[ses.3.4]"))%>%
+  filter(Group=="mother")%>%
+  arrange(ID)
+aux.long$ses[aux.long$scale=="PRAS"]="ses.3"
+# aux.long$ses = factor(aux.long$ses,levels=c("ses.4","ses.3"))
+
+mean_values = aux.long%>%
+  group_by(scale,ses) %>%
+  summarize(Mean=round(mean(value,na.rm=T),2),
+            sd=round(sd(value,na.rm=T),2))%>%
+    melt(.,id.vars = c("scale","ses"),variable.name = "statistic")
+
+mother = dcast(mean_values,scale~ses+statistic)
+
+dif_mother=sapply(main.wide[(main.wide$Group=="mother"), c("dif_Total.MAS","dif_Total.EDS","dif_Total.PSQI","dif_Total.PSS.14") ],
+                  function(x) paste0(round(mean(x,na.rm=T),n_dec)," (",round(sd(x,na.rm=T),n_dec),")")) 
+dif_mother=data.frame(value=dif_mother,scale=c("MAS","EDS","PSQI","PSS"))
+all = merge(mother,dif_mother,by='scale',all=T)
+
+C = matrix(c(0,1),nrow=1,byrow=T)
+sum_table = as.data.frame(matrix(,nrow=4,ncol=6))
+names(sum_table)=c("scale","Fstatistic","uncP","dfWithin","dfBetween","sgn")
+cont=0
+for (sc in unique(aux.long$scale)[1:4]){
+    cont=cont+1
+    ni = matrix(unname(table(aux.long$ID[aux.long$scale==sc])), ncol=1)
+    X = model.matrix(~ses, aux.long%>%filter(scale==sc))
+    Y = aux.long%>%filter(scale==sc)%>%select(value)%>%as.matrix()
+    stats <- lme_fit_FS(X, Zcols=c(1), Y , ni)
+    F_C <- lme_F(stats, C)
+    sum_table[cont,] = c(sc,F_C$F[1],F_C$pval[1],F_C$df[1:2],F_C$sgn)
+}
+sum_table = sum_table %>% 
+  mutate_at(c("Fstatistic","uncP","dfWithin","dfBetween","sgn"), as.numeric)%>%
+  mutate(partial_etaSq = Fstatistic*dfWithin/(Fstatistic*dfWithin+dfBetween),
+         fdr=p.adjust(uncP,method="fdr"),
+         fdr_signif=ifelse(fdr<0.05,"*",""),
+         Fstatistic = format(round(Fstatistic,2),nsmall=2),
+         sgn_effect=format(round(sgn*partial_etaSq,3),nsmall=3),
+         uncP=paste0(ifelse(uncP<0.0001,"<0.0001",format(round(uncP,4),nsmall=4)),fdr_signif)
+         )
+sm8 = merge(mother,sum_table%>%select(scale,Fstatistic,uncP,sgn_effect),by="scale",all=T)%>%
+  slice(match(c("PSS","PSQI","EDS","MAS","PRAS","MSS","BEQ"),scale))
+sm8$scale = c("Perceived Stress (PSS)","Sleep Quality (PSQI)","Depression Symptoms (EDS)","Maternal Attachment (MAS)","Pregnancy anxiety (PRAS)","Maternal Stress (MSS)","Birth Experience (BEQ)")
+colnames(sm8) = c("Questionnaire","Prg Mean","Prg SD","Post Mean","Post SD","F-statistic","Uncorrected p-value","Signed effect size") 
+sm8_latex <- knitr::kable(sm8%>%select(Questionnaire,`Post Mean`,`Post SD`,`Prg Mean`,`Prg SD`,`F-statistic`,`Uncorrected p-value`,`Signed effect size`),
+format = 'latex',escape=FALSE)
+```
+
+**SM Table IX:** Neuropsychological comparisons between mothers and nulliparous women.
+
+```{r group_comparison}
+aux = main.wide%>%
+  select(ID,Group,contains(c("Total.PSQI","Total.PSS.14")),-contains("dif"))
+colnames(aux)=str_remove(colnames(aux),"Total.")
+colnames(aux)=str_remove(colnames(aux),".14")
+aux.long <- reshape2::melt(aux, id.vars = c("ID","Group"), variable.name = "scale")%>%
+  mutate(ses=ifelse(str_detect(scale,"ses.3"),"ses.3","ses.4"),
+         scale=str_remove_all(scale,pattern = "[ses.3.4]"))%>%
+  arrange(ID)
+
+mean_values = aux.long%>%
+  group_by(scale,ses,Group) %>%
+  summarize(Mean=round(mean(value,na.rm=T),2),
+            SD=round(sd(value,na.rm=T),2))%>%
+  melt(.,id.vars = c("Group","scale","ses"),variable.name = "statistic")
+beh_comp_group = dcast(mean_values,scale+statistic~Group*ses)
+
+#lme
+C = matrix(c(0,1,0,0,
+             0,1,0,1,
+             0,0,0,1),nrow=3,byrow=T)
+con_name=c("Prg","Post","Group*Session")
+stats_sm9 = as.data.frame(matrix(,nrow=2*length(con_name),ncol=7))
+names(stats_sm9)=c("scale","contrast","Fstatistic","uncP","dfWithin","dfBetween","sgn")
+cont=0
+for (sc in unique(aux.long$scale)){
+  for (con in seq(1:length(con_name))){
+    cont=cont+1
+    ni = matrix(unname(table(aux.long$ID[aux.long$scale==sc])), ncol=1)
+    X = model.matrix(~Group*ses, aux.long%>%filter(scale==sc))
+    Y = aux.long%>%filter(scale==sc)%>%select(value)%>%as.matrix()
+    stats <- lme_fit_FS(X, Zcols=c(1), Y , ni)
+    F_C <- lme_F(stats, matrix(C[con,],nrow=1))
+    stats_sm9[cont,] = c(sc,con_name[con],F_C$F[1],F_C$pval[1],F_C$df[1:2],F_C$sgn)
+  }
+}
+stats_sm9 = stats_sm9 %>% 
+  mutate_at(c("Fstatistic","uncP","dfWithin","dfBetween","sgn"), as.numeric)%>%
+  mutate(partial_etaSq = Fstatistic*dfWithin/(Fstatistic*dfWithin+dfBetween),
+         fdr=p.adjust(uncP,method="fdr"),
+         fdr_signif=ifelse(fdr<0.05,"*",""),
+         Fstatistic = format(round(Fstatistic,2),nsmall=2),
+         sgn_effect=format(round(sgn*partial_etaSq,3),nsmall=3),
+         uncP=paste0(ifelse(uncP<0.0001,"<0.0001",format(round(uncP,4),nsmall=4)),fdr_signif),
+         dfBetween=format(round(dfBetween, 2), nsmall = 2),
+         df = paste0(dfWithin, ", ", dfBetween) )
+
+
+
+stats_sm9.long = melt(stats_sm9%>%select(scale,contrast,Fstatistic,df,uncP,sgn_effect),id.vars = c("scale","contrast"),variable.name = "statistic")
+stats_sm9.long = dcast(stats_sm9.long, scale+statistic~contrast,value.var="value")
+
+sm9 = merge(beh_comp_group,stats_sm9.long,by=c("scale","statistic"),all=T)%>%
+  mutate(statistic = case_when(statistic == "Mean" ~ "Mean",
+                               statistic == "SD" ~ "Standard deviation",
+                               statistic == "Fstatistic" ~ "F-statistic",
+                               statistic == "uncP" ~ "Uncorrected p-value",
+                               statistic == "df" ~ "Degrees of freedom",
+                               statistic == "sgn_effect" ~ "Signed effect size"),
+         scale = case_when( scale == "PSQI" ~ "Sleep Quality (PSQI)",
+                            scale == "PSS" ~ "Perceived Stress (PSS)",))%>%
+  select(scale, statistic, control_ses.3, control_ses.4, mother_ses.3, mother_ses.4,
+         Prg, Post,`Group*Session`)
+
+sm9_latex <- knitr::kable(sm9, format = 'latex',escape=T,booktabs=T) %>%
+  add_header_above(c(" " = 1, "Controls, N=34" = 2, "Mothers, N=1110" = 2, "Group comparisons" = 3))
+```
+
+
+#### Correlation Matrices.
+
+
+**SM Figure 5:** Complete correlation matrix of the neuropsychological variables in the mothers (N=110), including the scales at the late pregnancy (“Prg”) and early postpartum (“Post”) sessions. Circles represent the two-tailed Pearson coefficients of those correlations surviving a False Discovery Rate-corrected $P<0.05$. Blue and red circles indicate negative and positive correlations, respectively. From top to bottom, the neuropsychological variables correspond to the following questionnaires: Maternal Attachment Scale, Edinburgh Depression Scale, Pittsburgh Sleep Quality Index, Perceived Stress Scale, Pregnancy Anxiety Scale, Maternal Stress Scale, and Birth Experience Questionnaire. Abbreviations: Prg=Pregnancy session and Post=Postpartum session. 
+
+```{r data4corrmatrix_wided}
+df.exp = main.wide %>% 
+  filter(Group=="mother")%>%
+  select(ID,contains("Total.MAS"),dif_Total.MAS,contains("Total.EDS"),dif_Total.EDS,contains("Total.PSQI"),contains("PSS.14"),Total.PRAS,Total.MSS,Total.BEQ)
+
+colnames(df.exp) = c("ID","Attachment Prg","Attachment Post", "Attachment (Post - Prg)",
+                      "Depression Prg","Depression Post","Depression (Post - Prg)",
+                      "Sleep Quality Prg","Sleep Quality Post","Sleep Quality (Post - Prg)",
+                      "Stress Prg","Stress Post","Stress (Post - Prg)",
+                      "Anxiety Prg","Maternal Stress Post","Birth Experience Post")
+```
+
+```{r save_SMFIg6}
+M.long = cor(df.exp[,-1], use='na.or.complete')
+P.long = pvalue_cor(df.exp[,-1])
+threshold=fdr_thr(P.long)
+
+png("Supp_Fig_5.png",height=750,width=750)
+corrplot::corrplot(corr = M.long,p.mat=P.long,sig.level = threshold, insig="blank",
+                   tl.cex =1.25, tl.srt = 45,type = "lower",tl.col = "black",
+                   col = colFn(10),family="sans")
+dev.off()
+```
+
+**Figure 5:** Correlation matrix of the neuropsychological variables in the mothers’ group (N=110). The diagonal shows the distribution of the variables, the lower diagonal shows the scatterplots (with the least square regression lines and the $95%$ confidence intervals), and the upper diagonal shows the Pearson coefficients (R) and associated uncorrected p-values (p). Blue and red cells represent negative and positive correlations, respectively. Asterisks indicate Pearson coefficients (R) surviving a two-tailed p$<$0.05 False-Discovery Rate correction. From left to right, the neuropsychological variables correspond to the following questionnaires: Maternal Attachment Scale, Edinburgh Depression Scale, Pittsburgh Sleep Quality Index, Perceived Stress Scale, Pregnancy Anxiety Scale, Maternal Stress Scale, and Birth Experience Questionnaire. 
+
+```{r data4corrMatrix}
+df.exp = main.wide %>% 
+  filter(Group=="mother")%>%
+  select(ID,contains("dif"),Total.PRAS,Total.MSS,Total.BEQ)
+colnames(df.exp) = c("ID","Attachment \n(Post - Prg)","Depression \n(Post - Prg)","Sleep Quality \n(Post - Prg)","Stress \n(Post - Prg)", "Anxiety \nPrg","Maternal Stress \nPost","Birth Experience \nPost")
+```
+
+```{r Fig5}
+P.long = pvalue_cor(df.exp[,-1])
+
+p1 <- ggpairs(df.exp[,-1],
+              upper = list(continuous = wrap(my_fn,threshold=threshold)),
+              lower=list(continuous=my_fn2))+
+              theme(axis.text = element_text(size=16),
+                    strip.background =element_rect(fill="white"),
+                    strip.text.x = element_text(face="bold",size=30,angle = 90,hjust=0),
+                    strip.text.y=element_text(face="bold",size=30,angle=0,hjust=0))
+
+```
+
+```{r save_Fig5}
+png("Fig_5.png",width = 700, height = 500, units='mm', res = 300)
+p1
+dev.off()
+```
+
+
+**SM Figure 6:** Correlation matrix between the mothers’ global percentages of change in cortical metrics and the neuropsychological variables. From left to right, the neuropsychological variables correspond to the following questionnaires: Maternal Attachment Scale, Edinburgh Depression Scale, Pittsburgh Sleep Quality Index, Perceived Stress Scale, Pregnancy Anxiety Scale, Maternal Stress Scale, and Birth Experience Questionnaire. Abbreviations:p=uncorrected p-value, Post=Postpartum session, Prg=Pregnancy session, R=two-tailed Pearson correlation coefficient.
+
+```{r data4RMcorrMatrix}
+aux.exp = main.wide%>%
+  filter(Group=="mother")%>%
+  select(ID,contains("PrgToPost"),contains("dif"),Total.PRAS,Total.MSS,Total.BEQ)
+aux.long.exp = melt(aux.exp,id.vars = c("ID","CV.PrgToPost","CT.PrgToPost","SA.PrgToPost"),
+                    variable.name="scale")%>%
+  rename(scale_value=value)
+aux.long.exp = melt(aux.long.exp,id.vars=c("ID","scale","scale_value"),variable.name=c("measure"))%>%
+  rename(measure_value=value)%>%
+  mutate_at(vars(measure),funs(
+     forcats::fct_relevel(plyr::revalue(., c("CV.PrgToPost"="Cortical \nVolume",
+                                             "CT.PrgToPost"="Cortical \nThickness",
+                                             "SA.PrgToPost"="Surface \nArea")),
+                          c("Cortical \nVolume","Cortical \nThickness","Surface \nArea"))
+  ))%>%
+  mutate_at(vars(scale),funs(plyr::revalue(., c("dif_Total.MAS"="Attachment \n(Post - Prg)",
+                                            "dif_Total.EDS"="Depression \n(Post - Prg)",
+                                            "dif_Total.PSQI"="Sleep Quality \n(Post - Prg)",
+                                            "dif_Total.PSS.14"="Stress \n(Post - Prg)",
+                                            "Total.PRAS"="Anxiety \n(Prg)",
+                                            "Total.MSS"="Maternal Stress \n(Post)",
+                                            "Total.BEQ"="Birth Experience \n(Post)"))))
+```
+
+```{r computecorr}
+r_WB = aux.long.exp%>%
+  group_by(measure,scale) %>%
+  summarize(cor=cor.test(measure_value,scale_value,method="pearson")$estimate,
+            p=cor.test(measure_value, scale_value,method="pearson")$p.value)%>%
+mutate(label = paste0("R= ",round(cor,2),
+                        "\np= ",round(p,2)))
+```
+
+```{r SMFig6}
+Fig6SM = ggplot(aux.long.exp)+aes(x=scale_value,y=measure_value)+
+  geom_point()+
+  geom_smooth(color="black",method="lm")+
+  facet_grid(measure~scale, 
+             scales="free")+
+  theme_bw()+
+  theme(axis.text = element_text(size=13),
+        axis.title=element_blank(),
+        strip.background =element_rect(color=NA,fill=NA),
+        strip.text.x = element_text(face="bold",size=18),
+        strip.text.y=element_text(face="bold",size=18,angle=0,hjust=0))+
+   geom_label(data=r_WB,aes(label=label),hjust=-0.1,vjust=1.1,
+             x = -Inf, y = Inf, inherit.aes = FALSE,size=4)
+```
+
+```{r save_SMFig6}
+png("Supp_Fig_6.png",width = 600, height = 250, units='mm', res = 300)
+Fig6SM
+dev.off()
+```
+
+
+### GM cortical metrics as a function of childbirth
+
+#### Labor
+
+```{r data4labor}
+aux = main.wide%>%
+  select(ID,Group,BirthType,labor,PostPartum.pc,PostPartum.days,GestationalBirthWeeks,contains("CV"),contains("CT"),contains("SA"))%>%
+  mutate(CV.ses.3=CV.ses.3/1000,
+         CV.ses.4=CV.ses.4/1000,
+         SA.ses.3=SA.ses.3/100,
+         SA.ses.4=SA.ses.4/100)
+aux.long1 <- reshape2::melt(aux, id.vars = c("ID","Group","labor","BirthType","PostPartum.pc","PostPartum.days","GestationalBirthWeeks"),
+                           variable.name = "measure")%>%
+    mutate(ses=str_sub(measure,4,length(measure)),
+         measure=str_sub(measure,1,2))%>%
+  arrange(ID)
+
+aux.long2 =melt(main.wide%>%select(ID,labor,meanEulerNumber.ses.3,meanEulerNumber.ses.4,Age.ses.3,EstimatedTotalIntraCranialVol.ses.3), id.vars = c("ID","labor","Age.ses.3","EstimatedTotalIntraCranialVol.ses.3"), variable.name = "ses",value.name = "meanEulerNumber")%>%
+  mutate(ses=str_replace(ses,"meanEulerNumber.",""))%>%
+  arrange(ID)
+
+aux.long = merge(aux.long1,aux.long2,by=c("ID","labor","ses"),all=T)
+aux.long$labor=as.character(aux.long$labor)
+aux.long$labor = factor(ifelse(is.na(aux.long$labor),"Control",aux.long$labor))
+```
+
+```{r labor_assumptions}
+col_check=c("CV.ses.3","CV.ses.4","CV.PrgToPost","CT.ses.3","CT.ses.4","CT.PrgToPost","SA.ses.3","SA.ses.4","SA.PrgToPost")
+skew.labor = sapply(aux[aux$labor=="Labor",col_check], function(x) skewness(x))
+kurt.labor = sapply(aux[aux$labor=="Labor",col_check], function(x) kurtosis(x)) 
+any(abs(skew.labor)>2 )
+any(abs(kurt.labor)>7)
+skew.nonlabor = sapply(aux[aux$labor=="Non-Labor",col_check], function(x) skewness(x,na.rm = T)) 
+kurt.nonlabor = sapply(aux[aux$labor=="Non-Labor",col_check], function(x) kurtosis(x,na.rm=T)) 
+any(abs(skew.nonlabor)>2 )
+any(abs(kurt.nonlabor)>7)
+which(sapply(col_check, function(x) var.test(aux[[x]]~aux$labor,data=aux)$p.value)<0.05 )
+```
+
+**Supplementary Table X:**Descriptives and group comparison statistics of the global differences in
+cortical metrics at Pregnancy session (“Prg”), Postpartum session (“Post”), and “Prg-to-Post” in “Labor” and “Pre-Labor” mothers.
+
+```{r TableSMX}
+descriptives_sm10.long = aux.long%>%
+  filter(labor!="Control")%>%
+  filter(ses!="PrgToPost")%>%
+  ungroup()%>%
+    group_by(measure,ses,labor) %>%
+  summarize(#`Mean (SD)`=paste0(round(mean(value),2)," (",round(sd(value),2),")"),
+    Mean = round(mean(value),2),SD=round(sd(value),2))
+descriptives_sm10.long = melt(descriptives_sm10.long,id.vars = c("labor","measure","ses"),variable.name = "statistic")
+descriptives_sm10 = dcast(descriptives_sm10.long,measure+statistic~labor*ses,value.var="value")
+
+C = matrix(c(0,1,0,0,
+             0,1,0,1,
+             0,0,0,1),nrow=3,byrow=T)
+con_name=c("Prg","Post","Labor*Session")
+stats_sm10 = as.data.frame(matrix(,nrow=2*3,ncol=7))
+names(stats_sm10)=c("measure","contrast","Fstatistic","uncP","dfWithin","dfBetween","sgn")
+cont=0
+for (meas in c("CV","CT","SA")){
+  for (con in seq(1:3)){
+    cont=cont+1
+    ni = matrix(unname(table(aux.long$ID[aux.long$measure==meas&aux.long$ses!="PrgToPost"&aux.long$Group=="mother"])), ncol=1)
+    X = model.matrix(~labor*ses, aux.long%>%filter(measure==meas,ses!="PrgToPost",Group=="mother")%>%droplevels())
+    Y = aux.long%>%filter(measure==meas,ses!="PrgToPost",Group=="mother")%>%select(value)%>%as.matrix()
+    stats <- lme_fit_FS(X, Zcols=c(1), Y , ni)
+    F_C <- lme_F(stats, matrix(C[con,],nrow=1))
+    stats_sm10[cont,] = c(meas,con_name[con],F_C$F[1],F_C$pval[1],F_C$df[1:2],F_C$sgn)
+  }
+}
+stats_sm10 = stats_sm10 %>% 
+  mutate_at(c("Fstatistic","uncP","dfWithin","dfBetween","sgn"), as.numeric)%>%
+  mutate(partial_etaSq = Fstatistic*dfWithin/(Fstatistic*dfWithin+dfBetween),
+         fdr=p.adjust(uncP,method="fdr"),
+         fdr_signif=ifelse(fdr<0.05,"*",""),
+         sgn_effect=round(sgn*partial_etaSq,4),
+         label=paste0(format(round(sgn_effect,3), nsmall=3),fdr_signif),
+         Fstatistic=format(round(Fstatistic, 2), nsmall = 2),
+         dfBetween=format(round(dfBetween, 2), nsmall = 2),
+         uncP=ifelse(uncP<0.0001,"<0.0001",format(round(uncP, 4), nsmall = 4)),
+         uncP=paste0(uncP,fdr_signif),
+         df = paste0(dfWithin, ", ", dfBetween))
+
+stats_sm10.long = melt(stats_sm10%>%select(measure,contrast,Fstatistic,df,uncP,sgn_effect),id.vars = c("measure","contrast"),variable.name = "statistic")
+stats_sm10.long = dcast(stats_sm10.long, measure+statistic~contrast,value.var="value")
+
+sm10 = merge(descriptives_sm10,stats_sm10.long,by=c("measure","statistic"),all=T)%>%
+  left_join(data.frame(measure = c("CV","CT","SA")),.,meaure = "measure")%>%
+  mutate(statistic = case_when(statistic == "Mean" ~ "Mean",
+                               statistic == "SD" ~ "Standard deviation",
+                               statistic == "Fstatistic" ~ "F-statistic",
+                               statistic == "uncP" ~ "Uncorrected p-value",
+                               statistic == "df" ~ "Degrees of freedom",
+                               statistic == "sgn_effect" ~ "Signed effect size"),
+         measure = case_when(measure == "CV" ~ "Cortical Volume  [cm$^3$]",
+                             measure == "CT" ~ "Cortical Thickness [mm]",
+                             measure == "SA" ~ "Surface Area [cm$^2$]"))%>%
+  select(measure, statistic, Labor_ses.3, Labor_ses.4, `Non-Labor_ses.3`, `Non-Labor_ses.4`,
+         Prg, Post,`Labor*Session`)
+
+sm10_latex = knitr::kable(sm10, format = 'latex',escape=FALSE, col.names=c("","",rep(c("Prg","Post"),3),"Labor*Session"),booktabs=T) %>%
+  add_header_above(c("measure/statistic" = 2, "Labor mothers, N=99" = 2, "Pre-labor mothers, N=11" = 2, "Group differences" = 3))
+```
+
+**Figure 6:** Longitudinal changes in cortical metrics in mothers who initiated labor (“Labor”, N= 99) and mothers who underwent scheduled cesarean section (“Pre-labor”, N=11). 
+
+**a)** Distribution of the global percentages of change in cortical volume, thickness, and surface area. Longitudinal changes were derived from the group*session interaction fixed effect term of the adjusted linear mixed model $Cortical\ Metric \sim 1 + Group + Session + Group \times Session + (1 | Participant)$. Signed effect sizes were calculated as the partial eta squared ($\eta^{2}_{p}$) associated with the correspondent Wald F-tests. Asterisks indicate results surviving a p<0.05 False Discovery Rate correction. Nulliparous women (“Control”, N=34) are displayed as a reference. 
+
+```{r Fig6a}
+Fig6.a = ggplot(aux.long%>%filter(ses=="PrgToPost"))+aes(x=measure,y=value,fill=labor)+
+  geom_hline(yintercept = 0,alpha=0.8,linetype="dashed",colour="darkgray")+
+  geom_violin(position=position_dodge(0.9),alpha=0.75,scale="width",trim=F) +
+  geom_boxplot(position=position_dodge(0.9),alpha = .4, show.legend = FALSE,width=0.25,
+               outlier.shape = 18,outlier.alpha = 1,lwd=0.5) +
+  scale_x_discrete(name = "", labels = c("Cortical Volume", "Cortical Thickness","Surface Area")) +
+  scale_y_continuous(name = "% of change",breaks=seq(-4,8,2)) +
+  scale_fill_brewer(palette="Set2",
+                    labels = c("Control", "Labor", "Pre-Labor"))+
+  theme_bw()+
+  theme(axis.text.y = element_text(color="black",size=16),
+        axis.text.x = element_text(face="bold.italic",color="black",size=14,),
+        axis.title = element_text(color="black", size=16, face="bold.italic"),
+        legend.text = element_text(color="black", size=10),
+        legend.title=element_blank(),
+        legend.background=element_rect(color="black"),
+        legend.position = c(0.92,0.85))+
+  geom_segment(x=1,xend=1.3,y=-3.5,yend=-3.5)+
+  geom_segment(x=2,xend=2.3,y=-3.5,yend=-3.5)+
+  geom_segment(x=3,xend=3.3,y=-3.5,yend=-3.5)+
+  annotate("label",y = c(-4.2,-4.2,-4.2),x=c(1.15,2.15,3.15), label =unname(TeX(paste0("$\\eta_{p}^{2}=$", stats_sm10$label[stats_sm10$contrast=="Labor*Session"]))),size=4.75)
+```
+
+**b)** Correlations between the global percentages of change in cortical metrics and the percentage of postpartum time between sessions in “Labor” (orange) and “Pre-labor” (purple) mothers. The shading on the least squares regression line represents the $95%$ confidence interval. Asterisks indicate two-tailed Pearson coefficients (R) surviving a p$<$0.05 False Discovery Rate-correction. Abbreviations: p=uncorrected p-value and R=Pearson correlation coefficients. 
+
+```{r compute_Rlabor}
+r_WB = aux.long%>%
+  filter(Group=="mother",ses=="PrgToPost")%>%
+  group_by(measure,labor) %>%
+  summarize(cor=cor.test(value,PostPartum.pc)$estimate,
+            p=cor.test(value, PostPartum.pc)$p.value)%>%
+  mutate(labor=ifelse(labor=="Non-Labor","Pre-Labor","Labor"),
+         fdr.p=p.adjust(p,method="fdr"),
+         fdr.significance=ifelse(fdr.p<0.05,"*",""),
+         label = paste0(labor,"\n",
+                        "R= ",format(round(cor,2),nsmall=2),
+                        "\np= ",ifelse(p<0.0001,"<0.0001",format(round(p,3),scientific=F)),
+                        fdr.significance))
+r_WB$label = str_replace(r_WB$label, "=<" ,"<" )
+```
+
+```{r SMFig6b}
+CV = ggplot(aux.long%>%filter(Group=="mother",ses=="PrgToPost",measure=="CV"))+
+  aes(x=PostPartum.pc,y=value,colour=labor)+
+  geom_point()+
+  geom_smooth(aes(fill=labor),method="lm",se=T,show.legend=F,alpha=0.2)+
+  theme_bw()+
+  theme(legend.position="top")+
+  guides(color = guide_legend(override.aes = list(size=4.5)))+
+  theme(legend.background = element_rect( linetype="solid",colour ="black"))+
+  theme(axis.text = element_text(face="bold", color="black",size=14),
+        axis.title = element_text(color="black", size=16, face="bold.italic"),
+        legend.text=element_text(size=13),
+        legend.title=element_blank())+
+  ylab("% of change \n Cortical Volume")+
+  xlab("% Postpartum time")+
+  ylim(-2.3,6)+
+  scale_color_brewer(palette="Set2",breaks=c("Labor","Non-Labor"),drop = F,
+                     labels=r_WB$label[r_WB$measure=="CV"])
+
+CT = ggplot(aux.long%>%filter(Group=="mother",measure=="CT",ses=="PrgToPost"))+
+  aes(x=PostPartum.pc,y=value,colour=labor)+
+  geom_point()+
+  geom_smooth(aes(fill=labor),method="lm",se=T,show.legend=F,alpha=0.2)+
+  theme_bw()+
+  theme(legend.position="top")+
+  guides(color = guide_legend(override.aes = list(size=4.5)))+
+  theme(legend.background = element_rect( linetype="solid",colour ="black"))+
+  theme(axis.text = element_text(face="bold", color="black",size=14),
+        axis.title = element_text(color="black", size=16, face="bold.italic"),
+        legend.text=element_text(size=13),
+        legend.title=element_blank())+
+  ylab("% of change \n Cortical Thickness")+
+  xlab("% Postpartum time")+
+  ylim(-2.3,6)+
+  scale_color_brewer(palette="Set2",breaks=c("Labor","Non-Labor"),drop = F,
+                     labels=r_WB$label[r_WB$measure=="CT"])
+
+SA  = ggplot(aux.long%>%filter(Group=="mother",measure=="SA",ses=="PrgToPost"))+
+  aes(x=PostPartum.pc,y=value,colour=labor)+
+  geom_point()+
+  geom_smooth(aes(fill=labor),method="lm",se=T,show.legend=F,alpha=0.2)+
+  theme_bw()+
+  theme(legend.position="top")+
+  guides(color = guide_legend(override.aes = list(size=4.5)))+
+  theme(legend.background = element_rect( linetype="solid",colour ="black"))+
+  theme(axis.text = element_text(face="bold", color="black",size=14),
+        axis.title = element_text(color="black", size=16, face="bold.italic"),
+        legend.text=element_text(size=13),
+        legend.title=element_blank())+
+  ylab("% of change \n Surface Area")+
+  xlab("% Postpartum time")+
+  ylim(-1.5,2)+
+  scale_color_brewer(palette="Set2",breaks=c("Labor","Non-Labor"),drop = F,
+                     labels=r_WB$label[r_WB$measure=="SA"])
+```
+
+```{r save_Fig6}
+png("Fig_6.png",width = 350, height = 250, units='mm', res = 300)
+plot_grid(Fig6.a, plot_grid(CV,CT,SA, ncol=3,labels = c('b)', '', ''),label_size=20), 
+          ncol=1, labels = c('a)', ''),label_size=20)
+dev.off()
+```
+
+##### Supplementary analysis 
+
+**SM Table XI:** Group comparison statistics of the global differences in cortical metrics at Pregnancy session (“Prg”), Postpartum session (“Post”), and “Prg-to-Post” in “Labor” and “Pre-Labor” mothers accounting for participant’ age, intracranial volume, mean Euler number, gestational weeks at childbirth, and the time between childbirth and the postpartum session.
+
+```{r TableSMXI}
+C = matrix(c(0,1,0,0,0,0,0,0,0,
+             0,1,0,0,0,0,0,0,1,
+             0,0,0,0,0,0,0,0,1),nrow=3,byrow=T)
+con_name=c("Prg","Post","Labor*Session")
+stats_sm11 = as.data.frame(matrix(,nrow=2*3,ncol=7))
+names(stats_sm11)=c("measure","contrast","Fstatistic","uncP","dfWithin","dfBetween","sgn")
+cont=0
+for (meas in c("CV","CT","SA")){
+  for (con in seq(1:3)){
+    cont=cont+1
+    ni = matrix(unname(table(aux.long$ID[aux.long$measure==meas&aux.long$ses!="PrgToPost"&aux.long$Group=="mother"])), ncol=1)
+    X = model.matrix(~labor*ses+GestationalBirthWeeks+PostPartum.days+EstimatedTotalIntraCranialVol.ses.3+Age.ses.3+meanEulerNumber, aux.long%>%filter(measure==meas,ses!="PrgToPost",Group=="mother")%>%droplevels())
+    Y = aux.long%>%filter(measure==meas,ses!="PrgToPost",Group=="mother")%>%select(value)%>%as.matrix()
+    stats <- lme_fit_FS(X, Zcols=c(1), Y , ni)
+    F_C <- lme_F(stats, matrix(C[con,],nrow=1))
+    stats_sm11[cont,] = c(meas,con_name[con],F_C$F[1],F_C$pval[1],F_C$df[1:2],F_C$sgn)
+  }
+}
+stats_sm11 = stats_sm11 %>% 
+  mutate_at(c("Fstatistic","uncP","dfWithin","dfBetween","sgn"), as.numeric)%>%
+  mutate(partial_etaSq = Fstatistic*dfWithin/(Fstatistic*dfWithin+dfBetween),
+         fdr=p.adjust(uncP,method="fdr"),
+         fdr_signif=ifelse(fdr<0.05,"*",""),
+         sgn_effect=round(sgn*partial_etaSq,4),
+         label=paste0(format(round(sgn_effect,3), nsmall=3),fdr_signif),
+         Fstatistic=format(round(Fstatistic, 2), nsmall = 2),
+         dfBetween=format(round(dfBetween, 2), nsmall = 2),
+         uncP=ifelse(uncP<0.0001,"<0.0001",format(round(uncP, 4), nsmall = 4)),
+         uncP=paste0(uncP,fdr_signif),
+         df = paste0(dfWithin, ", ", dfBetween))
+
+stats_sm11.long = melt(stats_sm11%>%select(measure,contrast,Fstatistic,df,uncP,sgn_effect),id.vars = c("measure","contrast"),variable.name = "statistic")
+stats_sm11.long = dcast(stats_sm11.long, measure+statistic~contrast,value.var="value")%>%
+  left_join(data.frame(measure = c("CV","CT","SA")),.,meaure = "measure")
+
+sm11 =stats_sm11.long%>%
+  mutate(statistic = case_when(statistic == "Mean" ~ "Mean",
+                               statistic == "SD" ~ "Standard deviation",
+                               statistic == "Fstatistic" ~ "F-statistic",
+                               statistic == "uncP" ~ "Uncorrected p-value",
+                               statistic == "df" ~ "Degrees of freedom",
+                               statistic == "sgn_effect" ~ "Signed effect size"),
+         measure = case_when(measure == "CV" ~ "Cortical Volume  [cm$^3$]",
+                             measure == "CT" ~ "Cortical Thickness [mm]",
+                             measure == "SA" ~ "Surface Area [cm$^2$]"))%>%
+  select(measure, statistic, Prg, Post,`Labor*Session`)
+
+sm11_latex = knitr::kable(sm11, format = 'latex',escape=FALSE,booktabs=F) %>%
+  add_header_above(c("measure/statistic" = 2,"Group differences" = 3))
+```
+
+### Delivery method
+
+```{r data4delivery}
+aux = main.wide%>%
+  select(ID,Group,BirthType,contains("CV"),contains("CT"),contains("SA"))%>%
+ mutate(CV.ses.3=CV.ses.3/1000,
+         CV.ses.4=CV.ses.4/1000,
+         SA.ses.3=SA.ses.3/100,
+         SA.ses.4=SA.ses.4/100)
+
+aux.long <- reshape2::melt(aux, id.vars = c("ID","Group","BirthType"),
+                           variable.name = "measure")%>%
+    mutate(ses=str_sub(measure,4,length(measure)),
+         measure=str_sub(measure,1,2))%>%
+  arrange(ID)
+aux.long$BirthType = as.character(aux.long$BirthType)
+aux.long$BirthType = factor(ifelse(is.na(aux.long$BirthType),"Control",aux.long$BirthType))
+aux.long$BirthType =forcats::fct_relevel(aux.long$BirthType ,c("Vaginal","Emergency C-section","Scheduled C-section","Control"))
+```
+
+```{r BirthType_assumptions}
+aux2=aux%>%filter(Group=="mother")
+col_check=c("CV.PrgToPost","CT.PrgToPost","SA.PrgToPost")
+skew.vag = sapply(aux2[aux2$BirthType=="Vaginal",col_check], function(x) skewness(x))
+kurt.vag = sapply(aux2[aux2$BirthType=="Vaginal",col_check], function(x) kurtosis(x)) 
+any(abs(skew.vag)>2 )
+any(abs(kurt.vag)>7)
+skew.emcs = sapply(aux2[aux2$BirthType=="Emergency C-section",col_check], function(x) skewness(x,na.rm = T)) 
+kurt.emcs = sapply(aux2[aux2$BirthType=="Emergency C-section",col_check], function(x) kurtosis(x,na.rm=T)) 
+any(abs(skew.emcs)>2 )
+any(abs(kurt.emcs)>7)
+skew.scs = sapply(aux2[aux2$BirthType=="Scheduled C-section",col_check], function(x) skewness(x,na.rm = T)) 
+kurt.scs = sapply(aux2[aux2$BirthType=="Scheduled C-section",col_check], function(x) kurtosis(x,na.rm=T)) 
+any(abs(skew.scs)>2 )
+any(abs(kurt.scs)>7)
+```
+
+**SM Table XII:** Descriptives and group comparison statistics of the global differences in cortical metrics at Pregnancy-to-Postpartum ("Prg-to-Post") between mothers based on the delivery method.
+
+```{r TableSMXII}
+descriptives_sm12.long = aux.long%>%
+  filter(BirthType!="Control")%>%
+  filter(ses!="PrgToPost")%>%
+  ungroup()%>%
+    group_by(measure,ses,BirthType) %>%
+  summarize(#`Mean (SD)`=paste0(round(mean(value),2)," (",round(sd(value),2),")"),
+    Mean = round(mean(value),2),SD=round(sd(value),2))
+descriptives_sm12.long = melt(descriptives_sm12.long,id.vars = c("BirthType","measure","ses"),variable.name = "statistic")
+descriptives_sm12 = dcast(descriptives_sm12.long,measure+statistic~BirthType*ses,value.var="value")
+
+C = matrix(c(0,0,0,0,1,0,
+             0,0,0,0,0,1,
+             0,0,0,0,1,-1),nrow=3,byrow=T)
+con_name=c("VvsE","VvsS","EvsS")
+stats_sm12 = as.data.frame(matrix(,nrow=length(con_name)*3,ncol=7))
+names(stats_sm12)=c("measure","contrast","Fstatistic","uncP","dfWithin","dfBetween","sgn")
+cont=0
+for (meas in c("CV","CT","SA")){
+  for (con in seq(1:length(con_name))){
+    cont=cont+1
+    ni = matrix(unname(table(aux.long$ID[aux.long$measure==meas&aux.long$ses!="PrgToPost"&aux.long$Group=="mother"])), ncol=1)
+    X = model.matrix(~(BirthType)*ses, aux.long%>%filter(measure==meas,ses!="PrgToPost",Group=="mother")%>%droplevels())
+    Y = aux.long%>%filter(measure==meas,ses!="PrgToPost",Group=="mother")%>%select(value)%>%as.matrix()
+    stats <- lme_fit_FS(X, Zcols=c(1), Y , ni)
+    F_C <- lme_F(stats, matrix(C[con,],nrow=1))
+    stats_sm12[cont,] = c(meas,con_name[con],F_C$F[1],F_C$pval[1],F_C$df[1:2],F_C$sgn)
+  }
+}
+stats_sm12 = stats_sm12 %>% 
+  mutate_at(c("Fstatistic","uncP","dfWithin","dfBetween","sgn"), as.numeric)%>%
+  mutate(partial_etaSq = Fstatistic*dfWithin/(Fstatistic*dfWithin+dfBetween),
+         fdr=p.adjust(uncP,method="fdr"),
+         fdr_signif=ifelse(fdr<0.05,"*",""),
+         sgn_effect=round(sgn*partial_etaSq,4),
+         label=paste0(format(round(sgn_effect,3), nsmall=3),fdr_signif),
+         Fstatistic=format(round(Fstatistic, 2), nsmall = 2),
+         dfBetween=format(round(dfBetween, 2), nsmall = 2),
+         uncP=ifelse(uncP<0.0001,"<0.0001",format(round(uncP, 4), nsmall = 4)),
+         uncP=paste0(uncP,fdr_signif),
+         df = paste0(dfWithin, ", ", dfBetween))
+
+stats_sm12.long = melt(stats_sm12%>%select(measure,contrast,Fstatistic,df,uncP,sgn_effect),id.vars = c("measure","contrast"),variable.name = "statistic")
+stats_sm12.long = dcast(stats_sm12.long, measure+statistic~contrast,value.var="value")
+
+sm12 = merge(descriptives_sm12,stats_sm12.long,by=c("measure","statistic"),all=T)%>%
+  left_join(data.frame(measure = c("CV","CT","SA")),.,meaure = "measure")%>%
+  mutate(statistic = case_when(statistic == "Mean" ~ "Mean",
+                               statistic == "SD" ~ "Standard deviation",
+                               statistic == "Fstatistic" ~ "F-statistic",
+                               statistic == "uncP" ~ "Uncorrected p-value",
+                               statistic == "df" ~ "Degrees of freedom",
+                               statistic == "sgn_effect" ~ "Signed effect size"),
+         measure = case_when(measure == "CV" ~ "Cortical Volume  [cm$^3$]",
+                             measure == "CT" ~ "Cortical Thickness [mm]",
+                             measure == "SA" ~ "Surface Area [cm$^2$]"))%>%
+  select(measure, statistic,
+         Vaginal_ses.3,Vaginal_ses.4,`Emergency C-section_ses.3`,`Emergency C-section_ses.4`,`Scheduled C-section_ses.3`,`Scheduled C-section_ses.4`,
+VvsE, VvsS,EvsS)
+
+sm12_latex = knitr::kable(sm12, format = 'latex',escape=FALSE,booktabs=F,col.names = c("measure","statistic",rep(c("Prg","Post"),3),"Vaginal vs. Emergency C-section", "Vaginal vs. Scheduled C-section","Emergency vs. Schedyled C-sections"))%>%
+  add_header_above(c(" " = 2, "Vaginal mothers" = 2, "Emergency C-section mothers" = 2, "Scheduled C-section mothers" = 2, "Birth Type comparisons" = 3)) 
+```
+
+
+**SM Figure 7**: Global percentages of change in cortical metrics (y-axis) in mothers who underwent a vaginal (N= 87), emergency cesarean section (C-section, N= 12), or scheduled C-section (N= 11). Nulliparous women (“Control”, N= 34) are displayed as a reference.
+
+```{r SMFig7}
+aux.long$BirthType=as.character(aux.long$BirthType)
+aux.long$BirthType = factor(ifelse(is.na(aux.long$BirthType),"Control",aux.long$BirthType))
+aux.long$BirthType =forcats::fct_relevel(aux.long$BirthType ,c("Control","Vaginal","Emergency C-section","Scheduled C-section"))
+
+Fig7SM = ggplot(aux.long%>%filter(ses=="PrgToPost"))+aes(x=measure,y=value,fill=BirthType)+
+  geom_hline(yintercept = 0,alpha=0.8,linetype="dashed",colour="darkgray")+
+  geom_violin(position=position_dodge(0.9),alpha=0.75,scale="width",trim=F) +
+  geom_boxplot(position=position_dodge(0.9),alpha = .4, show.legend = FALSE,width=0.25,
+               outlier.shape = 18,outlier.alpha = 1,lwd=0.6) +
+  scale_x_discrete(name = "", labels = c("Cortical Volume", "Cortical Thickness","Surface Area")) +
+  scale_y_continuous(name = "Percentage of change",
+                     breaks=seq(-4,8,2),limits=c(-4.5,8.5)) +
+  scale_fill_brewer(palette="Accent")+
+  theme_bw()+
+  theme(axis.text.y = element_text(color="black",size=16),
+        axis.text.x = element_text(face="bold.italic", 
+                                   color="black",size=14,),
+        axis.title = element_text(color="black", size=16, face="bold.italic"),
+        legend.text = element_text(color="black", size=10),
+        legend.title=element_blank(),
+        legend.background=element_rect(color="black"),
+        legend.position = c(0.89,0.85))
+```
+
+```{r save_SMFig7}
+png("Supp_Fig_7.png",width = 250, height = 125, units='mm', res = 300)
+Fig7SM
+dev.off()
+```
+
+#### Supplementary
+
+Replication dataset.
+
+**Supplementary Figure 8:** Global percentages of change in cortical volume, thickness, and surface area in mothers (N=29) of the replication sample. Orange circles represent mothers who underwent a vaginal delivery (N=22), orange triangles show those who experienced emergency cesarean section (C-section, N=5), and purple squares represent those mothers with scheduled C-sections (N=2). Black horizontal lines represent the mean percentages of change values for the whole mothers’ sample and vertical lines their standard deviation. 
+
+```{r data4repl_childbirth}
+aux = repl.wide%>%select(ID,Group,labor,BirthType,PostPartum.pc,contains("PrgToPost"))
+aux.long <- reshape2::melt(aux, id.vars = c("ID","Group","labor","BirthType","PostPartum.pc"),variable.name = "measure")
+aux.long$labor =factor(aux.long$labor,levels=c("Control",levels(aux.long$labor)))
+```
+
+```{r SMFig8}
+mus =  aux.long%>%filter(Group=="mother")%>%
+  group_by(measure) %>%
+  summarize(mu=mean(value),
+            s=sd(value))
+Fig8SM = ggplot(aux.long%>%filter(Group=="mother"))+
+  aes(x=measure,y=value)+  
+  geom_beeswarm(aes(col=labor,shape=BirthType),size=6,cex=2.5,alpha=0.85)+
+  geom_point(data=mus,aes(x=measure,y=mu),shape=95,size=20)+
+  stat_summary(fun.data=mean_sdl, fun.args = list(mult=1), 
+        geom="errorbar", lwd=1,width=0.0,alpha=0.5)+
+  scale_x_discrete(name = "", 
+                   labels = c("Cortical Volume", "Cortical Thickness","Surface Area")) +
+  scale_y_continuous(name = "Percentage of change") +
+  scale_color_brewer(palette="Set2",
+                     breaks = c("Labor", "Non-Labor"),
+                     labels=c("Labor","Pre-Labor"),drop=F)+
+  theme_bw()+
+  theme(axis.text.y = element_text(color="black",size=16),
+        axis.text.x = element_text(face="bold.italic",color="black",size=14,),
+        axis.title = element_text(color="black", size=16, face="bold.italic"),
+        legend.text = element_text(color="black", size=10),
+        legend.title=element_blank(),
+        legend.background=element_rect(color="black"),
+        legend.position = "bottom")
+```
+
+```{r save_SMFig8}
+png("Supp_Fig_8.png",width = 220, height = 225, units='mm', res = 300)
+Fig8SM
+dev.off()
+```
+
+
+
+###Methods
+
+```{r data4methodsplot}
+aux.long =melt(main.wide%>%
+  select(ID,Group,contains("CV")), id.vars = c("ID","Group"), value.name = "CV")%>%
+  mutate(ses=str_sub(variable,4,length(variable)),
+         variable=NULL)
+aux.long2 =melt(main.wide%>%
+  select(ID,contains("CT")), id.vars = c("ID"), value.name = "CT")%>%
+  mutate(ses=str_sub(variable,4,length(variable)),
+         variable=NULL)
+aux.long3 =melt(main.wide%>%
+  select(ID,contains("SA")), id.vars = c("ID"), value.name = "SA")%>%
+  mutate(ses=str_sub(variable,4,length(variable)),
+         variable=NULL)
+
+aux=merge(aux.long,aux.long2,by=c("ID","ses"))%>%
+            merge(.,aux.long3,by=c("ID","ses"))%>%
+  filter(ses!="PrgToPost")%>%
+  arrange(ID)
+
+# CV
+mod.pp = nlme::lme(CV~Group,random=~1|ID,aux,method="REML")
+aux$CV.res = residuals(mod.pp)
+# CT
+mod.pp = nlme::lme(CT~Group,random=~1|ID,aux,method="REML")
+aux$CT.res = residuals(mod.pp)
+# SA
+mod.pp = nlme::lme(SA~Group,random=~1|ID,aux,method="REML")
+aux$SA.res = residuals(mod.pp)
+
+
+aux.s4 = aux%>%filter(ses=="ses.4")%>%select(contains("res"))
+aux.s3 = aux%>%filter(ses=="ses.3")%>%select(ID,Group,contains("CV"),contains("CT"),contains("SA"))
+aux.pch = (aux.s4-aux.s3%>%select(contains("res")))
+aux.pch[,c("ID","Group")] = aux.s3[,c("ID","Group")]
+
+aux2 = merge(aux.pch,main.wide%>%select(ID,CV.PrgToPost,CT.PrgToPost,SA.PrgToPost))
+aux2.long1 = melt(aux2%>%select(-contains("PrgToPost")),id.vars = c("ID","Group"),variable.name = "measure",value.name = "dif_res")%>%mutate(measure = str_sub(measure,1,2))
+aux2.long2 =   melt(aux2%>%select(-contains("res")),id.vars=c("ID","Group"),value.name = "PrgToPost",variable.name="measure")%>%mutate(measure = str_sub(measure,1,2))
+aux2.long = merge(aux2.long1,aux2.long2,by=c("ID","Group","measure"))%>% 
+         mutate_at(vars(measure),funs(
+           forcats::fct_relevel(plyr::revalue(., c("CV"="Cortical Volume",
+                                                   "CT"="Cortical Thickness",
+                                                   "SA"="Surface Area")),
+                                c("Cortical Volume","Cortical Thickness","Surface Area"))))
+```
+
+**Supplementary Figure 12:** Pearson (R) correlation between the percentage of change in cortical metrics and the difference of the residuals obtained from the reduced linear mixed effect models.
+
+```{r SMFig12}
+r_pearson = aux2.long%>%
+  group_by(measure)%>%
+  summarize(cor=cor.test(dif_res,PrgToPost,method="pearson")$estimate,
+            p=cor.test(dif_res, PrgToPost,method="pearson")$p.value,)%>%
+  mutate(label=paste0("R=",format(round(cor,3),nsmall=3)))
+         # "\np=",scales::scientific(p,digits=3)))
+
+col = "steelblue"
+
+Fig12SM = ggplot(aux2.long)+
+  aes(y=PrgToPost,x=dif_res)+
+  geom_point(color=col,size=2,alpha=0.8)+geom_smooth(method="lm",se=F,show.legend = F,color=col)+
+  xlab("Difference of the residuals")+ylab("% of change")+
+  theme_minimal()+
+  facet_wrap(.~measure,scales="free")+
+  theme_bw()+
+  # guides(color = guide_legend(override.aes = list(size=4.5)))+
+  theme(legend.background = element_rect( linetype="solid",colour ="black"))+
+  theme(axis.text = element_text(color="black",size=13),
+        axis.title = element_text(color="black", size=14, face="bold.italic"),
+        strip.text = element_text(face = "bold"),
+        strip.background=element_rect(colour="black",fill="white"))+
+  geom_label(y = Inf,x=-Inf, data= r_pearson,aes(label = label), vjust=1.1,hjust=-0.1,color="black")
+```
+
+```{r}
+png("SM_Fig12.png",width = 275, height = 100, units='mm', res = 300)
+Fig12SM
+dev.off()
+```
+
